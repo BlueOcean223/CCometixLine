@@ -1,6 +1,8 @@
 use super::{Segment, SegmentData};
-use crate::config::{InputData, SegmentId};
+use crate::config::{InputData, ModelConfig, SegmentId};
+use crate::utils::session_cost::session_cost;
 use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Default)]
 pub struct CostSegment;
@@ -13,26 +15,40 @@ impl CostSegment {
 
 impl Segment for CostSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
-        let cost_data = input.cost.as_ref()?;
+        // Claude Code prices models it does not know at Claude Opus rates, so models
+        // with configured prices are priced from the session's transcripts instead
+        let models = ModelConfig::load();
+        let configured = models.get_pricing(&input.model.id).and_then(|pricing| {
+            let cost = session_cost(
+                Path::new(&input.transcript_path),
+                &models,
+                &pricing.currency,
+            )?;
+            Some((cost, pricing.currency.clone(), "models_toml"))
+        });
+        let (cost, currency, source) = match configured {
+            Some(configured) => configured,
+            None => (
+                input.cost.as_ref()?.total_cost_usd?,
+                "$".to_string(),
+                "claude_code",
+            ),
+        };
 
         // Primary display: total cost
-        let primary = if let Some(cost) = cost_data.total_cost_usd {
-            if cost == 0.0 || cost < 0.01 {
-                "$0".to_string()
-            } else {
-                format!("${:.2}", cost)
-            }
+        let primary = if cost < 0.01 {
+            format!("{}0", currency)
         } else {
-            return None;
+            format!("{}{:.2}", currency, cost)
         };
 
         // Secondary display: empty for cost segment
         let secondary = String::new();
 
         let mut metadata = HashMap::new();
-        if let Some(cost) = cost_data.total_cost_usd {
-            metadata.insert("cost".to_string(), cost.to_string());
-        }
+        metadata.insert("cost".to_string(), cost.to_string());
+        metadata.insert("currency".to_string(), currency);
+        metadata.insert("source".to_string(), source.to_string());
 
         Some(SegmentData {
             primary,

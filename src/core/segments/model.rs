@@ -1,5 +1,5 @@
 use super::{Segment, SegmentData};
-use crate::config::{InputData, ModelConfig, SegmentId};
+use crate::config::{strip_bracket_tags, InputData, ModelConfig, SegmentId};
 use std::collections::HashMap;
 
 #[derive(Default)]
@@ -37,16 +37,18 @@ impl ModelSegment {
             // Model recognized by config, display_name already includes modifier suffix
             config_name
         } else {
-            // Fallback: prefer upstream display_name, fall back to model_id if empty
-            let base = if display_name.is_empty() {
-                id.to_string()
+            // Fallback: prefer upstream display_name, fall back to model_id if empty.
+            // For models it does not know, Claude Code passes the raw ID including
+            // context declarations such as `[1m]`, which are not part of the name.
+            let base = strip_bracket_tags(if display_name.is_empty() {
+                id
             } else {
-                display_name.to_string()
-            };
-            // Still apply context modifier suffix (e.g., " 1M") if present
+                display_name
+            });
+            // Apply a configured context modifier suffix, if any
             match model_config.get_display_suffix(id) {
                 Some(suffix) => format!("{}{}", base, suffix),
-                None => base,
+                None => base.to_string(),
             }
         }
     }

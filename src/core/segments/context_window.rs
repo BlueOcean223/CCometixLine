@@ -12,20 +12,41 @@ impl ContextWindowSegment {
     pub fn new() -> Self {
         Self
     }
+}
 
-    /// Get context limit for the specified model
-    fn get_context_limit_for_model(model_id: &str) -> u32 {
-        let model_config = ModelConfig::load();
-        model_config.get_context_limit(model_id)
-    }
+/// Resolve `(tokens used, context limit)` for the current model.
+///
+/// The limit is the smaller of the model's real window (a models.toml entry) and the
+/// window Claude Code works with: a larger real window is cut short by Claude Code's
+/// auto-compact, a smaller one by API errors. Claude Code reports its window as
+/// `context_window_size`; older versions infer it from the model ID.
+///
+/// Tokens come from `context_window.current_usage`, falling back to the transcript on
+/// older Claude Code versions or while `current_usage` is null (e.g. a resumed session
+/// before its first API response).
+fn resolve_context(input: &InputData, model_config: &ModelConfig) -> (Option<u32>, u32) {
+    let native = input.context_window.as_ref();
+
+    let claude_code_limit = native
+        .and_then(|cw| cw.context_window_size)
+        .filter(|&size| size > 0)
+        .unwrap_or_else(|| model_config.get_inferred_context_limit(&input.model.id));
+    let context_limit = match model_config.get_entry_context_limit(&input.model.id) {
+        Some(model_limit) => model_limit.min(claude_code_limit),
+        None => claude_code_limit,
+    };
+
+    let tokens = native
+        .and_then(|cw| cw.current_usage.as_ref())
+        .map(|usage| usage.context_tokens())
+        .or_else(|| parse_transcript_usage(&input.transcript_path));
+
+    (tokens, context_limit)
 }
 
 impl Segment for ContextWindowSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
-        // Dynamically determine context limit based on current model ID
-        let context_limit = Self::get_context_limit_for_model(&input.model.id);
-
-        let context_used_token_opt = parse_transcript_usage(&input.transcript_path);
+        let (context_used_token_opt, context_limit) = resolve_context(input, &ModelConfig::load());
 
         let (percentage_display, tokens_display) = match context_used_token_opt {
             Some(context_used_token) => {
@@ -269,4 +290,95 @@ fn try_find_usage_from_project_history(transcript_path: &Path) -> Option<u32> {
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(model_id: &str, extra: &str) -> InputData {
+        let json = format!(
+            r#"{{"model":{{"id":"{}","display_name":"Model"}},"workspace":{{"current_dir":"/tmp"}},"transcript_path":"/nonexistent/transcript.jsonl"{}}}"#,
+            model_id, extra
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    const USAGE: &str = r#""current_usage":{"input_tokens":5000,"output_tokens":1200,"cache_creation_input_tokens":10000,"cache_read_input_tokens":80000}"#;
+
+    #[test]
+    fn uses_native_usage_and_size() {
+        let input = input(
+            "claude-opus-5-5",
+            &format!(
+                r#","context_window":{{"context_window_size":1000000,{}}}"#,
+                USAGE
+            ),
+        );
+        // Includes the last response's output tokens, like the transcript fallback
+        assert_eq!(
+            resolve_context(&input, &ModelConfig::default()),
+            (Some(96_200), 1_000_000)
+        );
+    }
+
+    #[test]
+    fn smaller_real_window_wins() {
+        // Declared as 1M to Claude Code, but the model only serves 262k
+        let input = input(
+            "kimi-k2.7-code[1m]",
+            &format!(
+                r#","context_window":{{"context_window_size":1000000,{}}}"#,
+                USAGE
+            ),
+        );
+        assert_eq!(resolve_context(&input, &ModelConfig::default()).1, 262_144);
+    }
+
+    #[test]
+    fn smaller_claude_code_window_wins() {
+        // A 1M model without the [1m] declaration is compacted at Claude Code's 200k
+        let input = input(
+            "deepseek-flash",
+            &format!(
+                r#","context_window":{{"context_window_size":200000,{}}}"#,
+                USAGE
+            ),
+        );
+        assert_eq!(resolve_context(&input, &ModelConfig::default()).1, 200_000);
+    }
+
+    #[test]
+    fn null_current_usage_falls_back_to_transcript() {
+        let input = input(
+            "claude-opus-5-5",
+            r#","context_window":{"context_window_size":1000000,"current_usage":null}"#,
+        );
+        assert_eq!(
+            resolve_context(&input, &ModelConfig::default()),
+            (None, 1_000_000)
+        );
+    }
+
+    #[test]
+    fn without_native_data_uses_model_config() {
+        let config = ModelConfig::default();
+        assert_eq!(
+            resolve_context(&input("claude-opus-5-5[1m]", ""), &config).1,
+            1_000_000
+        );
+        assert_eq!(
+            resolve_context(&input("claude-opus-5-5", ""), &config).1,
+            200_000
+        );
+    }
+
+    #[test]
+    fn malformed_context_window_is_ignored() {
+        let input = input(
+            "claude-opus-5-5",
+            r#","context_window":{"context_window_size":"large"}"#,
+        );
+        assert!(input.context_window.is_none());
+    }
 }

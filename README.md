@@ -244,24 +244,45 @@ Supported segments: Directory, Git, Model, Usage, Time, Cost, OutputStyle
 
 Location: `~/.claude/ccline/models.toml` (auto-created on first run)
 
-This file configures how model IDs are displayed and their context window limits. Claude models (Sonnet, Opus, Haiku) are automatically recognized with version extraction — you only need this file for overrides or third-party models.
+This file configures model display names, context windows and prices. Claude models (Sonnet, Opus, Haiku) are automatically recognized with version extraction. Common third-party models (DeepSeek, GLM, Kimi, Qwen, MiniMax) are built in with their context windows and China-platform prices in CNY, see [`builtin_models.toml`](src/config/builtin_models.toml). Add entries here to override them (for example with USD prices from an international platform) or to add other models.
+
+- **Display name**: models without a configured name show Claude Code's model ID without tags such as `[1m]`.
+- **Context window**: the context segment uses the smaller of the model's `context_limit` and the window Claude Code works with. For a model ID it does not know, Claude Code uses 1M when the ID carries `[1m]`, otherwise the `CLAUDE_CODE_MAX_CONTEXT_TOKENS` environment variable, or 200k when that is unset. Claude Code compacts the conversation based on this window, so it should match the model's real window.
+- **Cost**: Claude Code prices models it does not know at Claude Opus rates. For models with `pricing`, the cost segment sums the session's transcripts (subagents included) at those prices instead. Requests Claude Code does not record in transcripts, such as session title generation, are not counted.
+- **Off-peak prices**: each request is priced at the time it was made. Public holidays are not tracked, so peak-hour requests on a weekday holiday are priced at peak rates.
 
 ```toml
-# Model entries: simple substring matching on the model ID
-# These take priority over built-in Claude model recognition
+# Entries match the model ID by substring, or exactly with match = "exact".
+# They take priority over built-in entries; fields left out fall back to the next match.
 [[models]]
-pattern = "glm-4.5"
-display_name = "GLM-4.5"
+pattern = "my-model"
+display_name = "My Model"
 context_limit = 128000
 
-[[models]]
-pattern = "kimi-k2"
-display_name = "Kimi K2"
-context_limit = 128000
+# Rates per 1M tokens
+[models.pricing]
+currency = "$"
+input = 0.3
+output = 1.2
+cache_read = 0.03       # defaults to input
+cache_write = 0.3       # 5-minute cache writes, defaults to input
+cache_write_1h = 0.6    # defaults to cache_write
 
-# Context modifiers: matched independently and composable with model entries
-# Overrides context_limit and appends display_suffix to the display name
-# e.g., model "Opus 4" + modifier " 1M" = "Opus 4 1M"
+# Higher rates once a request's input tokens (including cache) reach min_input
+[[models.pricing.tiers]]
+min_input = 32000
+input = 0.6
+output = 2.4
+
+# Discount outside peak hours
+[models.pricing.off_peak]
+multiplier = 0.5
+utc_offset = 8
+peak_hours = ["09:00-12:00", "14:00-18:00"]
+weekdays_only = true
+
+# Context declarations inside model IDs, used when Claude Code does not report
+# the context window itself. display_suffix optionally appends text to the name.
 [[context_modifiers]]
 pattern = "[1m]"
 display_suffix = " 1M"

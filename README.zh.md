@@ -236,24 +236,45 @@ CCometixLine 支持通过 TOML 文件和交互式 TUI 进行完整配置：
 
 文件位置：`~/.claude/ccline/models.toml`（首次运行时自动创建）
 
-此文件配置模型 ID 的显示名称及其上下文窗口限制。Claude 模型（Sonnet、Opus、Haiku）会自动识别并提取版本号，此文件仅用于覆盖默认行为或添加第三方模型支持。
+此文件配置模型的显示名称、上下文窗口和价格。Claude 模型（Sonnet、Opus、Haiku）会自动识别并提取版本号。常见第三方模型（DeepSeek、GLM、Kimi、Qwen、MiniMax）已内置上下文窗口和国内平台的人民币价格，见 [`builtin_models.toml`](src/config/builtin_models.toml)。在此文件中添加条目可以覆盖内置值（例如改用国际平台的美元价格），或添加其他模型。
+
+- **显示名称**：没有配置名称的模型显示 Claude Code 给出的模型 ID，并去掉 `[1m]` 这类标签。
+- **上下文窗口**：上下文段取模型 `context_limit` 与 Claude Code 实际使用的窗口中较小的一个。对它不认识的模型 ID，Claude Code 在 ID 带 `[1m]` 时按 1M 处理，否则使用环境变量 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 的值，未设置时按 200k。Claude Code 按这个窗口决定何时压缩对话，所以它应与模型的实际窗口一致。
+- **费用**：Claude Code 对不认识的模型按 Claude Opus 单价计费。配置了 `pricing` 的模型，费用段改为按这些单价汇总本会话的 transcript（含子代理）。Claude Code 不写入 transcript 的请求（如会话标题生成）不计入。
+- **峰谷价格**：每个请求按发出的时间计价。不识别法定节假日，节假日里的工作日在高峰时段的请求按高峰价计算。
 
 ```toml
-# 模型条目：基于模型 ID 的子字符串匹配
-# 优先级高于内置 Claude 模型识别
+# 条目按子字符串匹配模型 ID，设置 match = "exact" 则为精确匹配。
+# 优先级高于内置条目；未填写的字段沿用下一个匹配条目的值。
 [[models]]
-pattern = "glm-4.5"
-display_name = "GLM-4.5"
+pattern = "my-model"
+display_name = "My Model"
 context_limit = 128000
 
-[[models]]
-pattern = "kimi-k2"
-display_name = "Kimi K2"
-context_limit = 128000
+# 每百万 token 的单价
+[models.pricing]
+currency = "¥"
+input = 2.0
+output = 8.0
+cache_read = 0.2        # 默认等于 input
+cache_write = 2.0       # 5 分钟缓存写入，默认等于 input
+cache_write_1h = 4.0    # 默认等于 cache_write
 
-# 上下文修饰符：独立匹配，可与模型条目组合使用
-# 覆盖 context_limit 并将 display_suffix 追加到显示名称
-# 例如：模型 "Opus 4" + 修饰符 " 1M" = "Opus 4 1M"
+# 单次请求的输入 token（含缓存）达到 min_input 时改用的阶梯价
+[[models.pricing.tiers]]
+min_input = 32000
+input = 4.0
+output = 16.0
+
+# 非高峰时段折扣
+[models.pricing.off_peak]
+multiplier = 0.5
+utc_offset = 8
+peak_hours = ["09:00-12:00", "14:00-18:00"]
+weekdays_only = true
+
+# 模型 ID 中的上下文声明，在 Claude Code 未报告上下文窗口时使用。
+# display_suffix 可选，会追加到显示名称后。
 [[context_modifiers]]
 pattern = "[1m]"
 display_suffix = " 1M"
