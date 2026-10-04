@@ -111,12 +111,77 @@ pub struct OutputStyle {
 }
 
 #[derive(Deserialize)]
+pub struct ContextWindow {
+    pub context_window_size: Option<u32>,
+    /// `null` before the first API response and right after `/compact`
+    pub current_usage: Option<CurrentUsage>,
+}
+
+#[derive(Deserialize)]
+pub struct CurrentUsage {
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
+}
+
+impl CurrentUsage {
+    /// Tokens occupying the context window, including the last response's output,
+    /// which becomes input on the next request. Same formula as the transcript
+    /// fallback (`NormalizedUsage::context_tokens`); Claude Code's own
+    /// `used_percentage` excludes output tokens.
+    pub fn context_tokens(&self) -> u32 {
+        self.input_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+            + self.output_tokens
+    }
+}
+
+/// Present only for claude.ai Pro/Max subscribers, after the first API response.
+/// Each window may be independently absent; Claude Code drops a window once it resets.
+#[derive(Deserialize)]
+pub struct RateLimits {
+    pub five_hour: Option<RateLimitWindow>,
+    pub seven_day: Option<RateLimitWindow>,
+}
+
+#[derive(Deserialize)]
+pub struct RateLimitWindow {
+    /// 0 to 100
+    pub used_percentage: f64,
+    /// Unix epoch seconds
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
 pub struct InputData {
     pub model: Model,
     pub workspace: Workspace,
     pub transcript_path: String,
     pub cost: Option<Cost>,
     pub output_style: Option<OutputStyle>,
+    /// Claude Code version
+    pub version: Option<String>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub context_window: Option<ContextWindow>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub rate_limits: Option<RateLimits>,
+}
+
+/// Deserialize an optional field, treating a malformed value as absent so that
+/// a shape change in a newer Claude Code field does not blank the whole statusline.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(T::deserialize(value).ok())
 }
 
 // OpenAI-style nested token details

@@ -1,5 +1,5 @@
 use super::{Segment, SegmentData};
-use crate::config::{InputData, SegmentId};
+use crate::config::{InputData, RateLimitWindow, SegmentId};
 use crate::utils::credentials;
 use chrono::{DateTime, Datelike, Duration, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
@@ -25,6 +25,9 @@ struct ApiUsageCache {
     cached_at: String,
 }
 
+/// `(five_hour_utilization, seven_day_utilization, seven_day_resets_at)`, utilization in 0-100
+type UsageSnapshot = (f64, f64, Option<DateTime<Utc>>);
+
 #[derive(Default)]
 pub struct UsageSegment;
 
@@ -47,22 +50,43 @@ impl UsageSegment {
         }
     }
 
-    fn format_reset_time(reset_time_str: Option<&str>) -> String {
-        if let Some(time_str) = reset_time_str {
-            if let Ok(dt) = DateTime::parse_from_rfc3339(time_str) {
-                let mut local_dt = dt.with_timezone(&Local);
-                if local_dt.minute() > 45 {
-                    local_dt += Duration::hours(1);
-                }
-                return format!(
-                    "{}-{}-{}",
-                    local_dt.month(),
-                    local_dt.day(),
-                    local_dt.hour()
-                );
+    fn format_reset_time(reset_time: Option<DateTime<Utc>>) -> String {
+        if let Some(dt) = reset_time {
+            let mut local_dt = dt.with_timezone(&Local);
+            if local_dt.minute() > 45 {
+                local_dt += Duration::hours(1);
             }
+            return format!(
+                "{}-{}-{}",
+                local_dt.month(),
+                local_dt.day(),
+                local_dt.hour()
+            );
         }
         "?".to_string()
+    }
+
+    /// Rate limits reported by Claude Code on stdin.
+    fn usage_from_input(input: &InputData) -> Option<UsageSnapshot> {
+        let limits = input.rate_limits.as_ref()?;
+        if limits.five_hour.is_none() && limits.seven_day.is_none() {
+            return None;
+        }
+
+        // Claude Code drops a window once it resets, so a missing window has nothing used yet
+        let utilization =
+            |window: &Option<RateLimitWindow>| window.as_ref().map_or(0.0, |w| w.used_percentage);
+        let resets_at = limits
+            .seven_day
+            .as_ref()
+            .and_then(|w| w.resets_at)
+            .and_then(|ts| DateTime::from_timestamp(ts, 0));
+
+        Some((
+            utilization(&limits.five_hour),
+            utilization(&limits.seven_day),
+            resets_at,
+        ))
     }
 
     fn get_cache_path() -> Option<std::path::PathBuf> {
@@ -105,26 +129,6 @@ impl UsageSegment {
         }
     }
 
-    fn get_claude_code_version() -> String {
-        use std::process::Command;
-
-        let output = Command::new("npm")
-            .args(["view", "@anthropic-ai/claude-code", "version"])
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !version.is_empty() {
-                    return format!("claude-code/{}", version);
-                }
-            }
-            _ => {}
-        }
-
-        "claude-code".to_string()
-    }
-
     fn get_proxy_from_settings() -> Option<String> {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
@@ -148,9 +152,13 @@ impl UsageSegment {
         api_base_url: &str,
         token: &str,
         timeout_secs: u64,
+        claude_code_version: Option<&str>,
     ) -> Option<ApiUsageResponse> {
         let url = format!("{}/api/oauth/usage", api_base_url);
-        let user_agent = Self::get_claude_code_version();
+        let user_agent = match claude_code_version {
+            Some(version) => format!("claude-code/{}", version),
+            None => "claude-code".to_string(),
+        };
 
         let agent = if let Some(proxy_url) = Self::get_proxy_from_settings() {
             if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
@@ -178,10 +186,10 @@ impl UsageSegment {
 
         response.into_body().read_json().ok()
     }
-}
 
-impl Segment for UsageSegment {
-    fn collect(&self, _input: &InputData) -> Option<SegmentData> {
+    /// Query the OAuth usage API, with a file cache. Only needed when Claude Code
+    /// does not report `rate_limits` (before the first API response, or older versions).
+    fn usage_from_api(&self, claude_code_version: Option<&str>) -> Option<UsageSnapshot> {
         let token = credentials::get_oauth_token()?;
 
         // Load config from file to get segment options
@@ -217,7 +225,7 @@ impl Segment for UsageSegment {
                 cache.resets_at,
             )
         } else {
-            match self.fetch_api_usage(api_base_url, &token, timeout) {
+            match self.fetch_api_usage(api_base_url, &token, timeout, claude_code_version) {
                 Some(response) => {
                     let cache = ApiUsageCache {
                         five_hour_utilization: response.five_hour.utilization,
@@ -233,23 +241,36 @@ impl Segment for UsageSegment {
                     )
                 }
                 None => {
-                    if let Some(cache) = cached_data {
-                        (
-                            cache.five_hour_utilization,
-                            cache.seven_day_utilization,
-                            cache.resets_at,
-                        )
-                    } else {
-                        return None;
-                    }
+                    let cache = cached_data?;
+                    (
+                        cache.five_hour_utilization,
+                        cache.seven_day_utilization,
+                        cache.resets_at,
+                    )
                 }
             }
+        };
+
+        let resets_at = resets_at
+            .as_deref()
+            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+            .map(|dt| dt.with_timezone(&Utc));
+
+        Some((five_hour_util, seven_day_util, resets_at))
+    }
+}
+
+impl Segment for UsageSegment {
+    fn collect(&self, input: &InputData) -> Option<SegmentData> {
+        let (five_hour_util, seven_day_util, resets_at) = match Self::usage_from_input(input) {
+            Some(usage) => usage,
+            None => self.usage_from_api(input.version.as_deref())?,
         };
 
         let dynamic_icon = Self::get_circle_icon(seven_day_util / 100.0);
         let five_hour_percent = five_hour_util.round() as u8;
         let primary = format!("{}%", five_hour_percent);
-        let secondary = format!("· {}", Self::format_reset_time(resets_at.as_deref()));
+        let secondary = format!("· {}", Self::format_reset_time(resets_at));
 
         let mut metadata = HashMap::new();
         metadata.insert("dynamic_icon".to_string(), dynamic_icon);
@@ -271,5 +292,44 @@ impl Segment for UsageSegment {
 
     fn id(&self) -> SegmentId {
         SegmentId::Usage
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(extra: &str) -> InputData {
+        let json = format!(
+            r#"{{"model":{{"id":"claude-opus-5-5","display_name":"Opus"}},"workspace":{{"current_dir":"/tmp"}},"transcript_path":"/tmp/t.jsonl"{}}}"#,
+            extra
+        );
+        serde_json::from_str(&json).unwrap()
+    }
+
+    #[test]
+    fn reads_rate_limits_from_input() {
+        let input = input(
+            r#","rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}"#,
+        );
+        let (five_hour, seven_day, resets_at) = UsageSegment::usage_from_input(&input).unwrap();
+        assert_eq!(five_hour, 23.5);
+        assert_eq!(seven_day, 41.2);
+        assert_eq!(resets_at.unwrap().timestamp(), 1738857600);
+    }
+
+    #[test]
+    fn missing_window_counts_as_unused() {
+        let input = input(
+            r#","rate_limits":{"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}"#,
+        );
+        let (five_hour, _, _) = UsageSegment::usage_from_input(&input).unwrap();
+        assert_eq!(five_hour, 0.0);
+    }
+
+    #[test]
+    fn no_windows_falls_back() {
+        assert!(UsageSegment::usage_from_input(&input("")).is_none());
+        assert!(UsageSegment::usage_from_input(&input(r#","rate_limits":{}"#)).is_none());
     }
 }
