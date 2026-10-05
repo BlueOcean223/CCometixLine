@@ -1,4 +1,4 @@
-use super::{Segment, SegmentData};
+use super::{join_details, Segment, SegmentData};
 use crate::config::{InputData, RateLimitWindow, SegmentId};
 use crate::utils::credentials;
 use chrono::{DateTime, Local, Utc};
@@ -35,12 +35,33 @@ struct UsageSnapshot {
     five_hour_resets_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Default)]
-pub struct UsageSegment;
+pub struct UsageSegment {
+    show_reset_time: bool,
+    show_seven_day: bool,
+}
+
+impl Default for UsageSegment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl UsageSegment {
     pub fn new() -> Self {
-        Self
+        Self {
+            show_reset_time: true,
+            show_seven_day: true,
+        }
+    }
+
+    pub fn with_reset_time(mut self, show_reset_time: bool) -> Self {
+        self.show_reset_time = show_reset_time;
+        self
+    }
+
+    pub fn with_seven_day(mut self, show_seven_day: bool) -> Self {
+        self.show_seven_day = show_seven_day;
+        self
     }
 
     fn get_circle_icon(utilization: f64) -> String {
@@ -184,22 +205,17 @@ impl UsageSegment {
 
         // Load config from file to get segment options
         let config = crate::config::Config::load().ok()?;
-        let segment_config = config.segments.iter().find(|s| s.id == SegmentId::Usage);
-
-        let api_base_url = segment_config
-            .and_then(|sc| sc.options.get("api_base_url"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("https://api.anthropic.com");
-
+        let segment_config = config.segments.iter().find(|s| s.id == SegmentId::Usage)?;
+        let api_base_url = segment_config.option("api_base_url");
+        let api_base_url = api_base_url.as_str().unwrap_or_default();
         let cache_duration = segment_config
-            .and_then(|sc| sc.options.get("cache_duration"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(300);
-
+            .option("cache_duration")
+            .as_u64()
+            .unwrap_or_default();
         let timeout = segment_config
-            .and_then(|sc| sc.options.get("timeout"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or(2);
+            .option("timeout")
+            .as_u64()
+            .unwrap_or_default();
 
         let cache = match self.load_cache() {
             Some(cache) if self.is_cache_valid(&cache, cache_duration) => cache,
@@ -233,14 +249,15 @@ impl UsageSegment {
 
     /// The five-hour window's usage, with the icon showing the same window and its
     /// reset time, followed by the seven-day window's usage.
-    fn segment_data(usage: &UsageSnapshot) -> SegmentData {
+    fn segment_data(&self, usage: &UsageSnapshot) -> SegmentData {
         let primary = format!("{}%", usage.five_hour.round() as u8);
         let mut details = Vec::new();
-        if let Some(resets_at) = usage.five_hour_resets_at {
+        if let Some(resets_at) = usage.five_hour_resets_at.filter(|_| self.show_reset_time) {
             details.push(resets_at.with_timezone(&Local).format("%H:%M").to_string());
         }
-        details.push(format!("7d {}%", usage.seven_day.round() as u8));
-        let secondary = format!("· {}", details.join(" · "));
+        if self.show_seven_day {
+            details.push(format!("7d {}%", usage.seven_day.round() as u8));
+        }
 
         let mut metadata = HashMap::new();
         metadata.insert(
@@ -261,7 +278,7 @@ impl UsageSegment {
 
         SegmentData {
             primary,
-            secondary,
+            secondary: join_details(&details),
             metadata,
         }
     }
@@ -273,7 +290,7 @@ impl Segment for UsageSegment {
             Some(usage) => usage,
             None => self.usage_from_api(input.version.as_deref())?,
         };
-        Some(Self::segment_data(&usage))
+        Some(self.segment_data(&usage))
     }
 
     fn id(&self) -> SegmentId {
@@ -309,7 +326,7 @@ mod tests {
         );
 
         // Number, icon and reset time all describe the five-hour window
-        let data = UsageSegment::segment_data(&usage);
+        let data = UsageSegment::new().segment_data(&usage);
         let reset = usage
             .five_hour_resets_at
             .unwrap()
@@ -318,6 +335,16 @@ mod tests {
         assert_eq!(data.primary, "24%");
         assert_eq!(data.secondary, format!("· {} · 7d 41%", reset));
         assert_eq!(data.metadata["dynamic_icon"], "\u{f0a9f}");
+
+        let segment = UsageSegment::new().with_reset_time(false);
+        assert_eq!(segment.segment_data(&usage).secondary, "· 7d 41%");
+        let segment = UsageSegment::new().with_seven_day(false);
+        assert_eq!(
+            segment.segment_data(&usage).secondary,
+            format!("· {}", reset)
+        );
+        let segment = segment.with_reset_time(false);
+        assert_eq!(segment.segment_data(&usage).secondary, "");
     }
 
     #[test]
@@ -328,7 +355,10 @@ mod tests {
         let usage = UsageSegment::usage_from_input(&input).unwrap();
         assert_eq!(usage.five_hour, 0.0);
         assert_eq!(usage.five_hour_resets_at, None);
-        assert_eq!(UsageSegment::segment_data(&usage).secondary, "· 7d 41%");
+        assert_eq!(
+            UsageSegment::new().segment_data(&usage).secondary,
+            "· 7d 41%"
+        );
     }
 
     #[test]

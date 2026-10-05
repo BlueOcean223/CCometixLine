@@ -1,9 +1,9 @@
-use crate::config::Config;
+use crate::config::{Config, SegmentId};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, List, ListItem, ListState},
     Frame,
 };
 
@@ -13,7 +13,7 @@ pub enum Panel {
     Settings,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FieldSelection {
     Enabled,
     Icon,
@@ -21,7 +21,24 @@ pub enum FieldSelection {
     TextColor,
     BackgroundColor,
     TextStyle,
-    Options,
+    /// The segment's option at this position in `SegmentId::options`
+    Option(usize),
+}
+
+impl FieldSelection {
+    /// The settings panel's rows for a segment, top to bottom
+    pub fn all(id: SegmentId) -> Vec<FieldSelection> {
+        let mut fields = vec![
+            FieldSelection::Enabled,
+            FieldSelection::Icon,
+            FieldSelection::IconColor,
+            FieldSelection::TextColor,
+            FieldSelection::BackgroundColor,
+            FieldSelection::TextStyle,
+        ];
+        fields.extend((0..id.options().len()).map(FieldSelection::Option));
+        fields
+    }
 }
 
 #[derive(Default)]
@@ -70,6 +87,8 @@ impl SegmentListComponent {
                 Style::default()
             });
         let segments_list = List::new(items).block(segments_block);
-        f.render_widget(segments_list, area);
+        // The state scrolls the list to keep the selected segment visible
+        let mut state = ListState::default().with_selected(Some(selected_segment));
+        f.render_stateful_widget(segments_list, area, &mut state);
     }
 }

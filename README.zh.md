@@ -209,17 +209,7 @@ ccline --patch ~/.local/share/fnm/node-versions/v24.4.1/installation/lib/node_mo
 - `claude-3-5-sonnet` → `Sonnet 3.5`
 - `claude-4-sonnet` → `Sonnet 4`
 
-Claude Code 提供推理档位（effort）和快速模式时，会显示在模型名后面，例如 `Opus 5.5 · high · fast`。不想显示可以在 `config.toml` 的模型段里关掉：
-
-```toml
-[[segments]]
-id = "model"
-# ...
-
-[segments.options]
-show_effort = false
-show_fast_mode = false
-```
+Claude Code 提供推理档位（effort）和快速模式时，会显示在模型名后面，例如 `Opus 5.5 · high · fast`。两者都可以分别关闭，见[段选项](#段选项)。
 
 ### 上下文窗口显示
 
@@ -255,6 +245,24 @@ CCometixLine 支持通过 TOML 文件和交互式 TUI 进行完整配置：
 - 格式选项
 
 支持的段落：模型、目录、Git、上下文窗口、用量、费用、提示缓存、会话、输出样式
+
+### 段选项
+
+在 `ccline --config` 中选中一个段后按 Tab，设置面板里 Text Style 下面列出的就是它的选项。按 Enter 切换开关类选项；其他选项会弹出输入框，清空后确认即恢复默认值。这些选项保存在 `config.toml` 中该段的 `[segments.options]` 下。
+
+| 段 | 选项 | 键 | 默认值 |
+|---|---|---|---|
+| 模型 | 推理档位 | `show_effort` | 开 |
+| 模型 | 快速模式 | `show_fast_mode` | 开 |
+| Git | 提交 SHA | `show_sha` | 关 |
+| 用量 | 5 小时限额的重置时间 | `show_reset_time` | 开 |
+| 用量 | 7 天限额的用量 | `show_seven_day` | 开 |
+| 用量 | API 地址 | `api_base_url` | `https://api.anthropic.com` |
+| 用量 | API 结果的缓存时长（秒） | `cache_duration` | 180 |
+| 用量 | API 超时（秒） | `timeout` | 2 |
+| 提示缓存 | 过期时间 | `show_expiry` | 开 |
+
+用量段只在 Claude Code 没有提供限额数据时查询用量 API：会话第一次响应之前，或使用较旧版本的 Claude Code 时。
 
 ### 模型配置 (`models.toml`)
 

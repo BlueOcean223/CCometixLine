@@ -1,5 +1,5 @@
 use crate::config::{Config, SegmentId};
-use crate::core::segments::SegmentData;
+use crate::core::segments::{join_details, SegmentData};
 use crate::core::StatusLineGenerator;
 use ratatui::{
     layout::Rect,
@@ -94,13 +94,20 @@ impl PreviewComponent {
                 continue;
             }
 
+            // Details the segment's toggles can hide
+            let shown = |details: &[(&str, &str)]| {
+                let details: Vec<&str> = details
+                    .iter()
+                    .filter(|(key, _)| segment_config.toggle(key))
+                    .map(|(_, detail)| *detail)
+                    .collect();
+                join_details(&details)
+            };
+
             let mock_data = match segment_config.id {
                 SegmentId::Model => SegmentData {
                     primary: "Sonnet 4".to_string(),
-                    secondary: match segment_config.options.get("show_effort") {
-                        Some(serde_json::Value::Bool(false)) => String::new(),
-                        _ => "· high".to_string(),
-                    },
+                    secondary: shown(&[("show_effort", "high"), ("show_fast_mode", "fast")]),
                     metadata: {
                         let mut map = HashMap::new();
                         map.insert("model".to_string(), "claude-4-sonnet-20250512".to_string());
@@ -118,7 +125,11 @@ impl PreviewComponent {
                 },
                 SegmentId::Git => SegmentData {
                     primary: "master".to_string(),
-                    secondary: "✓".to_string(),
+                    secondary: if segment_config.toggle("show_sha") {
+                        "✓ a1b2c3d".to_string()
+                    } else {
+                        "✓".to_string()
+                    },
                     metadata: {
                         let mut map = HashMap::new();
                         map.insert("branch".to_string(), "master".to_string());
@@ -141,7 +152,7 @@ impl PreviewComponent {
                 },
                 SegmentId::Usage => SegmentData {
                     primary: "24%".to_string(),
-                    secondary: "· 14:00 · 7d 41%".to_string(),
+                    secondary: shown(&[("show_reset_time", "14:00"), ("show_seven_day", "7d 41%")]),
                     metadata: HashMap::new(),
                 },
                 SegmentId::Cost => SegmentData {
@@ -175,7 +186,7 @@ impl PreviewComponent {
                 },
                 SegmentId::PromptCache => SegmentData {
                     primary: "92%".to_string(),
-                    secondary: "· 14:32".to_string(),
+                    secondary: shown(&[("show_expiry", "14:32")]),
                     metadata: {
                         let mut map = HashMap::new();
                         map.insert("hit_ratio".to_string(), "0.92".to_string());

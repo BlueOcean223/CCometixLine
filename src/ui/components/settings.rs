@@ -1,5 +1,5 @@
 use super::segment_list::{FieldSelection, Panel};
-use crate::config::{Config, StyleMode};
+use crate::config::{Config, OptionDefault, SegmentConfig, SegmentOption, StyleMode};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -198,7 +198,9 @@ impl SettingsComponent {
                 spans.extend(content);
                 Line::from(spans)
             };
-            let lines = vec![
+            let options = segment.id.options();
+            let branch = |last: bool| if last { "└─" } else { "├─" };
+            let mut lines = vec![
                 Line::from(format!("{} Segment", segment_name)),
                 create_field_line(
                     FieldSelection::Enabled,
@@ -248,7 +250,8 @@ impl SettingsComponent {
                 create_field_line(
                     FieldSelection::TextStyle,
                     vec![Span::raw(format!(
-                        "├─ Text Style: Bold {}",
+                        "{} Text Style: Bold {}",
+                        branch(options.is_empty()),
                         if segment.styles.text_bold {
                             "[✓]"
                         } else {
@@ -256,14 +259,25 @@ impl SettingsComponent {
                         }
                     ))],
                 ),
-                create_field_line(
-                    FieldSelection::Options,
-                    vec![Span::raw(format!(
-                        "└─ Options: {} items",
-                        segment.options.len()
-                    ))],
-                ),
             ];
+            for (index, option) in options.iter().enumerate() {
+                lines.push(create_field_line(
+                    FieldSelection::Option(index),
+                    vec![Span::raw(format!(
+                        "{} {}: {}",
+                        branch(index + 1 == options.len()),
+                        option.label,
+                        option_text(segment, option)
+                    ))],
+                ));
+            }
+            // Scroll to keep the selected row visible on short terminals; the
+            // segment name takes the first line
+            let selected_line = 1 + FieldSelection::all(segment.id)
+                .iter()
+                .position(|field| field == selected_field)
+                .unwrap_or(0);
+            let scroll = (selected_line + 1).saturating_sub(area.height.saturating_sub(2) as usize);
             let text = Text::from(lines);
             let settings_block = Block::default()
                 .borders(Borders::ALL)
@@ -273,7 +287,9 @@ impl SettingsComponent {
                 } else {
                     Style::default()
                 });
-            let settings_panel = Paragraph::new(text).block(settings_block);
+            let settings_panel = Paragraph::new(text)
+                .block(settings_block)
+                .scroll((scroll as u16, 0));
             f.render_widget(settings_panel, area);
         } else {
             let settings_block = Block::default()
@@ -287,5 +303,21 @@ impl SettingsComponent {
             let settings_panel = Paragraph::new("No segment selected").block(settings_block);
             f.render_widget(settings_panel, area);
         }
+    }
+}
+
+/// An option's value as the settings panel shows it
+fn option_text(segment: &SegmentConfig, option: &SegmentOption) -> String {
+    let value = segment.option(option.key);
+    match option.default {
+        OptionDefault::Toggle(_) => {
+            if value.as_bool() == Some(true) {
+                "✓".to_string()
+            } else {
+                "✗".to_string()
+            }
+        }
+        OptionDefault::Text(_) => value.as_str().unwrap_or_default().to_string(),
+        OptionDefault::Seconds(_) => format!("{}s", value),
     }
 }

@@ -92,6 +92,119 @@ impl SegmentId {
             SegmentId::PromptCache => "Prompt Cache",
         }
     }
+
+    /// Options the segment reads from `[segments.options]`, in the order the
+    /// configuration UI lists them
+    pub fn options(&self) -> &'static [SegmentOption] {
+        match self {
+            SegmentId::Model => MODEL_OPTIONS,
+            SegmentId::Git => GIT_OPTIONS,
+            SegmentId::Usage => USAGE_OPTIONS,
+            SegmentId::PromptCache => PROMPT_CACHE_OPTIONS,
+            _ => &[],
+        }
+    }
+}
+
+const MODEL_OPTIONS: &[SegmentOption] = &[
+    SegmentOption::new("show_effort", "Effort Level", OptionDefault::Toggle(true)),
+    SegmentOption::new("show_fast_mode", "Fast Mode", OptionDefault::Toggle(true)),
+];
+
+const GIT_OPTIONS: &[SegmentOption] = &[SegmentOption::new(
+    "show_sha",
+    "Commit SHA",
+    OptionDefault::Toggle(false),
+)];
+
+const USAGE_OPTIONS: &[SegmentOption] = &[
+    SegmentOption::new("show_reset_time", "Reset Time", OptionDefault::Toggle(true)),
+    SegmentOption::new("show_seven_day", "7-Day Usage", OptionDefault::Toggle(true)),
+    // For the usage API, queried only when Claude Code does not report rate limits
+    SegmentOption::new(
+        "api_base_url",
+        "API Base URL",
+        OptionDefault::Text("https://api.anthropic.com"),
+    ),
+    SegmentOption::new(
+        "cache_duration",
+        "API Cache Duration",
+        OptionDefault::Seconds(180),
+    ),
+    SegmentOption::new("timeout", "API Timeout", OptionDefault::Seconds(2)),
+];
+
+const PROMPT_CACHE_OPTIONS: &[SegmentOption] = &[SegmentOption::new(
+    "show_expiry",
+    "Expiry Time",
+    OptionDefault::Toggle(true),
+)];
+
+/// An entry in a segment's `[segments.options]`
+pub struct SegmentOption {
+    pub key: &'static str,
+    /// Name shown in the configuration UI
+    pub label: &'static str,
+    /// The option's type, and its value when the config leaves it out
+    pub default: OptionDefault,
+}
+
+impl SegmentOption {
+    const fn new(key: &'static str, label: &'static str, default: OptionDefault) -> Self {
+        Self {
+            key,
+            label,
+            default,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum OptionDefault {
+    Toggle(bool),
+    Text(&'static str),
+    /// A whole number of seconds
+    Seconds(u64),
+}
+
+impl OptionDefault {
+    /// Whether a value from the config has this option's type
+    pub fn accepts(&self, value: &serde_json::Value) -> bool {
+        match self {
+            OptionDefault::Toggle(_) => value.is_boolean(),
+            OptionDefault::Text(_) => value.is_string(),
+            OptionDefault::Seconds(_) => value.is_u64(),
+        }
+    }
+}
+
+impl From<OptionDefault> for serde_json::Value {
+    fn from(default: OptionDefault) -> Self {
+        match default {
+            OptionDefault::Toggle(on) => on.into(),
+            OptionDefault::Text(text) => text.into(),
+            OptionDefault::Seconds(seconds) => seconds.into(),
+        }
+    }
+}
+
+impl SegmentConfig {
+    /// One of the segment's `SegmentId::options`: the config's value, or the
+    /// default when the config leaves it out or gives a value of another type
+    pub fn option(&self, key: &str) -> serde_json::Value {
+        let Some(option) = self.id.options().iter().find(|option| option.key == key) else {
+            return serde_json::Value::Null;
+        };
+        match self.options.get(key) {
+            Some(value) if option.default.accepts(value) => value.clone(),
+            _ => option.default.into(),
+        }
+    }
+
+    /// Whether one of the segment's toggles is on
+    pub fn toggle(&self, key: &str) -> bool {
+        self.option(key).as_bool().unwrap_or(false)
+    }
 }
 
 // Legacy compatibility structure
@@ -415,7 +528,11 @@ impl Config {
             && self.color_matches(&current.colors.text, &preset.colors.text)
             && self.color_matches(&current.colors.background, &preset.colors.background)
             && current.styles.text_bold == preset.styles.text_bold
-            && current.options == preset.options
+            && current
+                .id
+                .options()
+                .iter()
+                .all(|option| current.option(option.key) == preset.option(option.key))
     }
 
     /// Compare two optional colors for equality
@@ -581,5 +698,68 @@ mod tests {
         let before = config.segments.len();
         config.add_missing_segments();
         assert_eq!(config.segments.len(), before);
+    }
+
+    #[test]
+    fn options_fall_back_to_their_defaults() {
+        let preset = ThemePresets::builtin_theme("default");
+        let mut model = preset.segments[0].clone();
+        assert_eq!(model.id, SegmentId::Model);
+        model.options.clear();
+        assert!(model.toggle("show_effort"));
+
+        model
+            .options
+            .insert("show_effort".to_string(), serde_json::Value::Bool(false));
+        assert!(!model.toggle("show_effort"));
+        // A value of the wrong type counts as left out
+        model
+            .options
+            .insert("show_fast_mode".to_string(), serde_json::json!("no"));
+        assert!(model.toggle("show_fast_mode"));
+        // Keys outside the segment's options have no value
+        assert_eq!(model.option("show_sha"), serde_json::Value::Null);
+
+        let mut usage = model.clone();
+        usage.id = SegmentId::Usage;
+        assert_eq!(usage.option("timeout"), serde_json::json!(2));
+        assert_eq!(
+            usage.option("api_base_url"),
+            serde_json::json!("https://api.anthropic.com")
+        );
+    }
+
+    #[test]
+    fn theme_options_have_the_types_segments_read() {
+        for (name, _) in ThemePresets::get_available_themes() {
+            for segment in ThemePresets::builtin_theme(name).segments {
+                for (key, value) in &segment.options {
+                    let option = segment.id.options().iter().find(|o| o.key == key);
+                    assert!(
+                        option.is_some_and(|o| o.default.accepts(value)),
+                        "{} theme, {:?} segment: {} = {}",
+                        name,
+                        segment.id,
+                        key,
+                        value
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn options_set_to_their_defaults_still_match_the_theme() {
+        let config = ThemePresets::builtin_theme("default");
+        let preset = &config.segments[0];
+        let mut model = preset.clone();
+        model
+            .options
+            .insert("show_effort".to_string(), serde_json::Value::Bool(true));
+        assert!(config.segment_matches(&model, preset));
+        model
+            .options
+            .insert("show_effort".to_string(), serde_json::Value::Bool(false));
+        assert!(!config.segment_matches(&model, preset));
     }
 }

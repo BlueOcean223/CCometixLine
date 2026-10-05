@@ -217,17 +217,7 @@ Shows simplified Claude model names:
 - `claude-3-5-sonnet` → `Sonnet 3.5`
 - `claude-4-sonnet` → `Sonnet 4`
 
-When Claude Code reports them, the reasoning effort level and fast mode follow the name, as in `Opus 5.5 · high · fast`. To hide them, set these options on the model segment in `config.toml`:
-
-```toml
-[[segments]]
-id = "model"
-# ...
-
-[segments.options]
-show_effort = false
-show_fast_mode = false
-```
+When Claude Code reports them, the reasoning effort level and fast mode follow the name, as in `Opus 5.5 · high · fast`. Either can be hidden, see [Segment Options](#segment-options).
 
 ### Context Window Display
 
@@ -263,6 +253,24 @@ All segments are configurable with:
 - Format options
 
 Supported segments: Model, Directory, Git, Context Window, Usage, Cost, Prompt Cache, Session, Output Style
+
+### Segment Options
+
+In `ccline --config`, select a segment and press Tab: its options follow Text Style in the settings panel. Enter switches an on/off option, or opens an input box for other values, where an empty input restores the default. `config.toml` keeps them under the segment's `[segments.options]`.
+
+| Segment | Option | Key | Default |
+|---|---|---|---|
+| Model | Effort level | `show_effort` | on |
+| Model | Fast mode | `show_fast_mode` | on |
+| Git | Commit SHA | `show_sha` | off |
+| Usage | Reset time of the 5-hour limit | `show_reset_time` | on |
+| Usage | Usage of the 7-day limit | `show_seven_day` | on |
+| Usage | API base URL | `api_base_url` | `https://api.anthropic.com` |
+| Usage | API cache duration, in seconds | `cache_duration` | 180 |
+| Usage | API timeout, in seconds | `timeout` | 2 |
+| Prompt Cache | Expiry time | `show_expiry` | on |
+
+The Usage segment queries the usage API only when Claude Code does not report rate limits: before a session's first response, or with older Claude Code versions.
 
 ### Model Configuration (`models.toml`)
 

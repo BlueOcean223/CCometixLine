@@ -1,16 +1,28 @@
-use super::{Segment, SegmentData};
+use super::{join_details, Segment, SegmentData};
 use crate::config::{InputData, SegmentId};
 use chrono::{DateTime, Local};
 use std::collections::HashMap;
 
 /// The prompt cache hit ratio Claude Code reports for the main conversation and, for
 /// Claude models, when the cache goes cold.
-#[derive(Default)]
-pub struct PromptCacheSegment;
+pub struct PromptCacheSegment {
+    show_expiry: bool,
+}
+
+impl Default for PromptCacheSegment {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl PromptCacheSegment {
     pub fn new() -> Self {
-        Self
+        Self { show_expiry: true }
+    }
+
+    pub fn with_expiry(mut self, show_expiry: bool) -> Self {
+        self.show_expiry = show_expiry;
+        self
     }
 }
 
@@ -28,15 +40,14 @@ impl Segment for PromptCacheSegment {
 
         // Claude Code derives expiry from Anthropic's cache lifetimes (5 minutes or
         // 1 hour), which other providers' caches do not follow
-        let secondary = if !input.model.id.to_lowercase().contains("claude") {
-            String::new()
-        } else if !cache.warm {
-            "· cold".to_string()
-        } else {
-            expires_at.map_or(String::new(), |time| {
-                format!("· {}", time.with_timezone(&Local).format("%H:%M"))
-            })
-        };
+        let mut details = Vec::new();
+        if self.show_expiry && input.model.id.to_lowercase().contains("claude") {
+            if !cache.warm {
+                details.push("cold".to_string());
+            } else if let Some(time) = expires_at {
+                details.push(time.with_timezone(&Local).format("%H:%M").to_string());
+            }
+        }
 
         let mut metadata = HashMap::new();
         metadata.insert("hit_ratio".to_string(), hit_ratio.to_string());
@@ -47,7 +58,7 @@ impl Segment for PromptCacheSegment {
 
         Some(SegmentData {
             primary: format!("{}%", (hit_ratio * 100.0).round() as u8),
-            secondary,
+            secondary: join_details(&details),
             metadata,
         })
     }
@@ -61,12 +72,16 @@ impl Segment for PromptCacheSegment {
 mod tests {
     use super::*;
 
-    fn collect(model: &str, prompt_cache: &str) -> Option<SegmentData> {
+    fn input(model: &str, prompt_cache: &str) -> InputData {
         let json = format!(
             r#"{{"model":{{"id":"{}","display_name":""}},"workspace":{{"current_dir":"/tmp"}},"transcript_path":"/tmp/t.jsonl","prompt_cache":{}}}"#,
             model, prompt_cache
         );
-        PromptCacheSegment::new().collect(&serde_json::from_str(&json).unwrap())
+        serde_json::from_str(&json).unwrap()
+    }
+
+    fn collect(model: &str, prompt_cache: &str) -> Option<SegmentData> {
+        PromptCacheSegment::new().collect(&input(model, prompt_cache))
     }
 
     #[test]
@@ -82,6 +97,16 @@ mod tests {
             .format("%H:%M");
         assert_eq!(data.primary, "92%");
         assert_eq!(data.secondary, format!("· {}", expiry));
+
+        let input = input(
+            "claude-opus-5-5",
+            r#"{"warm":true,"caching_observed":true,"expires_at":1738425600,"hit_ratio":0.917}"#,
+        );
+        let data = PromptCacheSegment::new()
+            .with_expiry(false)
+            .collect(&input)
+            .unwrap();
+        assert_eq!(data.secondary, "");
 
         let data = collect(
             "claude-opus-5-5",

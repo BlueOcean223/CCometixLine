@@ -25,6 +25,15 @@ pub struct SegmentData {
     pub metadata: HashMap<String, String>,
 }
 
+/// Secondary text listing details that follow the primary text, as in `· high · fast`
+pub fn join_details<S: AsRef<str>>(details: &[S]) -> String {
+    details
+        .iter()
+        .map(|detail| format!("· {}", detail.as_ref()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 // Re-export all segment types
 pub use context_window::ContextWindowSegment;
 pub use cost::CostSegment;

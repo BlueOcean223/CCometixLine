@@ -1,4 +1,4 @@
-use crate::config::{Config, StyleMode};
+use crate::config::{Config, OptionDefault, StyleMode};
 use crate::ui::components::{
     color_picker::{ColorPickerComponent, NavDirection},
     help::HelpComponent,
@@ -40,6 +40,9 @@ pub struct App {
     theme_selector: ThemeSelectorComponent,
     help: HelpComponent,
     status_message: Option<String>,
+    /// Option of the selected segment that the input box is editing, by position
+    /// in `SegmentId::options`; the input box asks for a theme name otherwise
+    editing_option: Option<usize>,
 }
 
 impl App {
@@ -60,6 +63,7 @@ impl App {
             theme_selector: ThemeSelectorComponent::new(),
             help: HelpComponent::new(),
             status_message: None,
+            editing_option: None,
         };
         app.preview.update_preview(&config);
         app
@@ -72,16 +76,7 @@ impl App {
         }
 
         // Load config
-        let mut config = Config::load().unwrap_or_else(|_| Config::default());
-
-        // If a theme is specified, reload it to get the latest changes
-        if !config.theme.is_empty() && config.theme != "default" {
-            if let Ok(theme_config) =
-                crate::ui::themes::ThemePresets::load_theme_from_file(&config.theme)
-            {
-                config = theme_config;
-            }
-        }
+        let config = Config::load().unwrap_or_else(|_| Config::default());
 
         // Terminal setup
         enable_raw_mode()?;
@@ -105,12 +100,20 @@ impl App {
                 // Handle popup events first
                 if app.name_input.is_open {
                     match key.code {
-                        KeyCode::Esc => app.name_input.close(),
+                        KeyCode::Esc => {
+                            app.name_input.close();
+                            app.editing_option = None;
+                        }
                         KeyCode::Enter => {
-                            if let Some(name) = app.name_input.get_input() {
+                            if let Some(index) = app.editing_option {
+                                if !app.set_option_from_input(index) {
+                                    continue;
+                                }
+                            } else if let Some(name) = app.name_input.get_input() {
                                 app.save_as_new_theme(&name);
                             }
                             app.name_input.close();
+                            app.editing_option = None;
                         }
                         KeyCode::Char(c) => app.name_input.input_char(c),
                         KeyCode::Backspace => app.name_input.backspace(),
@@ -463,29 +466,30 @@ impl App {
                     .min((self.config.segments.len() - 1) as i32)
                     as usize;
                 self.selected_segment = new_selection;
+                self.clamp_selected_field();
             }
             Panel::Settings => {
-                let field_count = 7; // Enabled, Icon, IconColor, TextColor, TextStyle, BackgroundColor, Options
-                let current_field = match self.selected_field {
-                    FieldSelection::Enabled => 0i32,
-                    FieldSelection::Icon => 1,
-                    FieldSelection::IconColor => 2,
-                    FieldSelection::TextColor => 3,
-                    FieldSelection::BackgroundColor => 4,
-                    FieldSelection::TextStyle => 5,
-                    FieldSelection::Options => 6,
+                let Some(segment) = self.config.segments.get(self.selected_segment) else {
+                    return;
                 };
-                let new_field = (current_field + delta).clamp(0, field_count - 1) as usize;
-                self.selected_field = match new_field {
-                    0 => FieldSelection::Enabled,
-                    1 => FieldSelection::Icon,
-                    2 => FieldSelection::IconColor,
-                    3 => FieldSelection::TextColor,
-                    4 => FieldSelection::BackgroundColor,
-                    5 => FieldSelection::TextStyle,
-                    6 => FieldSelection::Options,
-                    _ => FieldSelection::Enabled,
-                };
+                let fields = FieldSelection::all(segment.id);
+                let current = fields
+                    .iter()
+                    .position(|field| *field == self.selected_field)
+                    .unwrap_or(0);
+                let new_field = (current as i32 + delta).clamp(0, fields.len() as i32 - 1);
+                self.selected_field = fields[new_field as usize];
+            }
+        }
+    }
+
+    /// Keep the settings selection on a row the selected segment has, as segments
+    /// differ in their options
+    fn clamp_selected_field(&mut self) {
+        if let Some(segment) = self.config.segments.get(self.selected_segment) {
+            let fields = FieldSelection::all(segment.id);
+            if !fields.contains(&self.selected_field) {
+                self.selected_field = fields[fields.len() - 1];
             }
         }
     }
@@ -542,14 +546,79 @@ impl App {
                             self.preview.update_preview(&self.config);
                         }
                     }
-                    FieldSelection::Options => {
-                        // TODO: Implement options editor
-                        self.status_message =
-                            Some("Options editor not implemented yet".to_string());
-                    }
+                    FieldSelection::Option(index) => self.edit_option(index),
                 }
             }
         }
+    }
+
+    /// Switch a toggle, or open the input box for an option with another type
+    fn edit_option(&mut self, index: usize) {
+        let Some(segment) = self.config.segments.get_mut(self.selected_segment) else {
+            return;
+        };
+        let Some(option) = segment.id.options().get(index) else {
+            return;
+        };
+        match option.default {
+            OptionDefault::Toggle(_) => {
+                let on = !segment.toggle(option.key);
+                segment.options.insert(option.key.to_string(), on.into());
+                self.status_message = Some(format!(
+                    "{} {}",
+                    option.label,
+                    if on { "shown" } else { "hidden" }
+                ));
+                self.preview.update_preview(&self.config);
+            }
+            OptionDefault::Text(_) | OptionDefault::Seconds(_) => {
+                let text = |value: serde_json::Value| match value {
+                    serde_json::Value::String(text) => text,
+                    value => value.to_string(),
+                };
+                let value = text(segment.option(option.key));
+                let default = text(option.default.into());
+                self.name_input.open_value(option.label, &value, &default);
+                self.editing_option = Some(index);
+            }
+        }
+    }
+
+    /// Set the option being edited to the input box's value; an empty input
+    /// restores the default. Returns false, keeping the input box open, when the
+    /// input is not a valid value.
+    fn set_option_from_input(&mut self, index: usize) -> bool {
+        let Some(option) = self
+            .config
+            .segments
+            .get(self.selected_segment)
+            .and_then(|segment| segment.id.options().get(index))
+        else {
+            return true;
+        };
+        let input = self.name_input.input.trim();
+        let value = if input.is_empty() {
+            option.default.into()
+        } else if let OptionDefault::Seconds(_) = option.default {
+            match input.parse::<u64>() {
+                Ok(seconds) => seconds.into(),
+                Err(_) => {
+                    self.status_message = Some(format!(
+                        "{} must be a whole number of seconds",
+                        option.label
+                    ));
+                    return false;
+                }
+            }
+        } else {
+            input.into()
+        };
+        if let Some(segment) = self.config.segments.get_mut(self.selected_segment) {
+            segment.options.insert(option.key.to_string(), value);
+        }
+        self.status_message = Some(format!("{} updated", option.label));
+        self.preview.update_preview(&self.config);
+        true
     }
 
     fn switch_panel(&mut self) {
@@ -611,6 +680,7 @@ impl App {
     fn switch_to_theme(&mut self, theme_name: &str) {
         self.config = crate::ui::themes::ThemePresets::get_theme(theme_name);
         self.selected_segment = 0;
+        self.clamp_selected_field();
         self.preview.update_preview(&self.config);
         self.status_message = Some(format!("Switched to {} theme", theme_name));
     }
@@ -620,6 +690,7 @@ impl App {
         let current_theme = self.config.theme.clone();
         self.config = crate::ui::themes::ThemePresets::get_theme(&current_theme);
         self.selected_segment = 0;
+        self.clamp_selected_field();
         self.preview.update_preview(&self.config);
         self.status_message = Some(format!("Reset {} theme to defaults", current_theme));
     }
@@ -685,5 +756,75 @@ impl App {
     fn open_separator_editor(&mut self) {
         self.status_message = Some("Opening separator editor...".to_string());
         self.separator_editor.open(&self.config.style.separator);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SegmentId;
+    use crate::ui::themes::ThemePresets;
+
+    /// An app with the settings panel of one segment of the default theme open
+    fn settings_of(id: SegmentId) -> App {
+        let mut app = App::new(ThemePresets::builtin_theme("default"));
+        app.selected_segment = app.config.segments.iter().position(|s| s.id == id).unwrap();
+        app.selected_panel = Panel::Settings;
+        app
+    }
+
+    fn segment(app: &App) -> &crate::config::SegmentConfig {
+        &app.config.segments[app.selected_segment]
+    }
+
+    #[test]
+    fn enter_switches_a_toggle() {
+        let mut app = settings_of(SegmentId::Model);
+        app.selected_field = FieldSelection::TextStyle;
+        app.move_selection(1);
+        assert_eq!(app.selected_field, FieldSelection::Option(0));
+        app.toggle_current();
+        assert!(!segment(&app).toggle("show_effort"));
+        app.toggle_current();
+        assert!(segment(&app).toggle("show_effort"));
+
+        // The last row is the last option
+        app.move_selection(10);
+        assert_eq!(app.selected_field, FieldSelection::Option(1));
+    }
+
+    #[test]
+    fn input_box_sets_other_options() {
+        let mut app = settings_of(SegmentId::Usage);
+        let timeout = SegmentId::Usage
+            .options()
+            .iter()
+            .position(|option| option.key == "timeout")
+            .unwrap();
+        app.selected_field = FieldSelection::Option(timeout);
+        app.toggle_current();
+        assert!(app.name_input.is_open);
+        assert_eq!(app.name_input.input, "2");
+
+        app.name_input.input = "2.5".to_string();
+        assert!(!app.set_option_from_input(timeout));
+        app.name_input.input = "5".to_string();
+        assert!(app.set_option_from_input(timeout));
+        assert_eq!(segment(&app).option("timeout"), serde_json::json!(5));
+
+        // An empty input restores the default
+        app.name_input.input.clear();
+        assert!(app.set_option_from_input(timeout));
+        assert_eq!(segment(&app).option("timeout"), serde_json::json!(2));
+    }
+
+    #[test]
+    fn selection_leaves_options_the_next_segment_lacks() {
+        let mut app = settings_of(SegmentId::Model);
+        app.selected_field = FieldSelection::Option(1);
+        app.selected_panel = Panel::SegmentList;
+        app.move_selection(1);
+        assert_eq!(segment(&app).id, SegmentId::Directory);
+        assert_eq!(app.selected_field, FieldSelection::TextStyle);
     }
 }

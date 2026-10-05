@@ -1,4 +1,4 @@
-use super::{Segment, SegmentData};
+use super::{join_details, Segment, SegmentData};
 use crate::config::{strip_bracket_tags, InputData, ModelConfig, SegmentId};
 use std::collections::HashMap;
 
@@ -62,15 +62,9 @@ impl ModelSegment {
                 details.push("fast".to_string());
             }
         }
-        let secondary = if details.is_empty() {
-            String::new()
-        } else {
-            format!("· {}", details.join(" · "))
-        };
-
         SegmentData {
             primary: Self::format_model_name(models, &input.model.id, &input.model.display_name),
-            secondary,
+            secondary: join_details(&details),
             metadata,
         }
     }

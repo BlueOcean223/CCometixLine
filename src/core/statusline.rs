@@ -392,16 +392,9 @@ pub fn collect_all_segments(
 
         let segment_data = match segment_config.id {
             crate::config::SegmentId::Model => {
-                let option = |key: &str| {
-                    segment_config
-                        .options
-                        .get(key)
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(true)
-                };
                 let segment = ModelSegment::new()
-                    .with_effort(option("show_effort"))
-                    .with_fast_mode(option("show_fast_mode"));
+                    .with_effort(segment_config.toggle("show_effort"))
+                    .with_fast_mode(segment_config.toggle("show_fast_mode"));
                 segment.collect(input)
             }
             crate::config::SegmentId::Directory => {
@@ -409,12 +402,7 @@ pub fn collect_all_segments(
                 segment.collect(input)
             }
             crate::config::SegmentId::Git => {
-                let show_sha = segment_config
-                    .options
-                    .get("show_sha")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                let segment = GitSegment::new().with_sha(show_sha);
+                let segment = GitSegment::new().with_sha(segment_config.toggle("show_sha"));
                 segment.collect(input)
             }
             crate::config::SegmentId::ContextWindow => {
@@ -422,7 +410,9 @@ pub fn collect_all_segments(
                 segment.collect(input)
             }
             crate::config::SegmentId::Usage => {
-                let segment = UsageSegment::new();
+                let segment = UsageSegment::new()
+                    .with_reset_time(segment_config.toggle("show_reset_time"))
+                    .with_seven_day(segment_config.toggle("show_seven_day"));
                 segment.collect(input)
             }
             crate::config::SegmentId::Cost => {
@@ -442,7 +432,8 @@ pub fn collect_all_segments(
                 segment.collect(input)
             }
             crate::config::SegmentId::PromptCache => {
-                let segment = PromptCacheSegment::new();
+                let segment =
+                    PromptCacheSegment::new().with_expiry(segment_config.toggle("show_expiry"));
                 segment.collect(input)
             }
         };

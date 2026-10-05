@@ -5,12 +5,17 @@ use ratatui::{
     Frame,
 };
 
+/// Single-line input box, for theme names and option values
 #[derive(Debug, Clone)]
 pub struct NameInputComponent {
     pub is_open: bool,
     pub input: String,
     pub title: String,
     pub placeholder: String,
+    /// Title of the input field
+    label: String,
+    /// Theme names become file names, so they are limited to letters, digits, `_` and `-`
+    any_character: bool,
 }
 
 impl Default for NameInputComponent {
@@ -26,6 +31,8 @@ impl NameInputComponent {
             input: String::new(),
             title: "Input Name".to_string(),
             placeholder: "Enter name...".to_string(),
+            label: "Name".to_string(),
+            any_character: false,
         }
     }
 
@@ -34,6 +41,16 @@ impl NameInputComponent {
         self.input.clear();
         self.title = title.to_string();
         self.placeholder = placeholder.to_string();
+        self.label = "Name".to_string();
+        self.any_character = false;
+    }
+
+    /// Open with a value to edit; the placeholder shows when the input is empty
+    pub fn open_value(&mut self, title: &str, value: &str, placeholder: &str) {
+        self.open(title, placeholder);
+        self.input = value.to_string();
+        self.label = "Value".to_string();
+        self.any_character = true;
     }
 
     pub fn close(&mut self) {
@@ -42,7 +59,11 @@ impl NameInputComponent {
     }
 
     pub fn input_char(&mut self, c: char) {
-        if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+        if (self.any_character && !c.is_control())
+            || c.is_ascii_alphanumeric()
+            || c == '_'
+            || c == '-'
+        {
             self.input.push(c);
         }
     }
@@ -114,7 +135,11 @@ impl NameInputComponent {
                 } else {
                     Style::default().fg(Color::Yellow)
                 })
-                .block(Block::default().borders(Borders::ALL).title("Name")),
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(self.label.as_str()),
+                ),
             chunks[0],
         );
 
