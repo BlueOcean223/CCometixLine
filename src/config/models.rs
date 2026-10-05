@@ -296,8 +296,15 @@ impl ModelConfig {
         Ok(config)
     }
 
+    /// The built-in table with the user's models.toml in front. Loaded once per
+    /// process, since several segments use it in each render.
+    pub fn load() -> &'static Self {
+        static MODEL_CONFIG: OnceLock<ModelConfig> = OnceLock::new();
+        MODEL_CONFIG.get_or_init(Self::read)
+    }
+
     /// Load model configuration with fallback locations
-    pub fn load() -> Self {
+    fn read() -> Self {
         let mut model_config = Self::default();
 
         // First, try to create default models.toml if it doesn't exist

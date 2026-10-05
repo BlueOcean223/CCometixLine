@@ -19,11 +19,7 @@ impl Segment for CostSegment {
         // with configured prices are priced from the session's transcripts instead
         let models = ModelConfig::load();
         let configured = models.get_pricing(&input.model.id).and_then(|pricing| {
-            let cost = session_cost(
-                Path::new(&input.transcript_path),
-                &models,
-                &pricing.currency,
-            )?;
+            let cost = session_cost(Path::new(&input.transcript_path), models, &pricing.currency)?;
             Some((cost, pricing.currency.clone(), "models_toml"))
         });
         let (cost, currency, source) = match configured {

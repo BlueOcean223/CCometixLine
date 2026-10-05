@@ -34,7 +34,7 @@ impl ModelSegment {
 
 impl Segment for ModelSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
-        Some(self.segment_data(input, &ModelConfig::load()))
+        Some(self.segment_data(input, ModelConfig::load()))
     }
 
     fn id(&self) -> SegmentId {

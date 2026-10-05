@@ -53,7 +53,7 @@ fn resolve_context(input: &InputData, model_config: &ModelConfig) -> (Option<u32
 
 impl Segment for ContextWindowSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
-        let (context_used_token_opt, context_limit) = resolve_context(input, &ModelConfig::load());
+        let (context_used_token_opt, context_limit) = resolve_context(input, ModelConfig::load());
 
         let (percentage_display, tokens_display) = match context_used_token_opt {
             Some(context_used_token) => {
