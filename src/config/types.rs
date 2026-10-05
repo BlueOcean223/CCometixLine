@@ -118,9 +118,21 @@ const GIT_OPTIONS: &[SegmentOption] = &[SegmentOption::new(
 )];
 
 const USAGE_OPTIONS: &[SegmentOption] = &[
-    SegmentOption::new("show_reset_time", "Reset Time", OptionDefault::Toggle(true)),
+    SegmentOption::new(
+        "show_reset_time",
+        "5-Hour Reset Time",
+        OptionDefault::Toggle(true),
+    ),
     SegmentOption::new("show_seven_day", "7-Day Usage", OptionDefault::Toggle(true)),
-    // For the usage API, queried only when Claude Code does not report rate limits
+    SegmentOption::new(
+        "show_seven_day_reset",
+        "7-Day Reset Time",
+        OptionDefault::Toggle(false),
+    ),
+    // Only the usage API reports it, so turning it on queries the API
+    SegmentOption::new("show_fable", "Fable Usage", OptionDefault::Toggle(false)),
+    // For the usage API, queried when Claude Code does not report rate limits, or for
+    // Fable usage
     SegmentOption::new(
         "api_base_url",
         "API Base URL",

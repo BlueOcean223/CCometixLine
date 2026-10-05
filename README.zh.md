@@ -217,7 +217,7 @@ Claude Code 提供推理档位（effort）和快速模式时，会显示在模�
 
 ### 用量显示
 
-适用于 Claude 订阅：5 小时限额的已用比例和重置时间，以及 7 天限额的已用比例，例如 `24% · 14:00 · 7d 41%`。
+适用于 Claude 订阅：5 小时限额的已用比例和重置时间，以及 7 天限额的已用比例，例如 `24% · 14:00 · 7d 41%`。可通过选项加上 7 天限额的重置时间和 Fable 每周限额的已用比例，例如 `24% · 14:00 · 7d 41% · 10-08 14:00 · Fable 12%`。
 
 ### 提示缓存显示
 
@@ -257,12 +257,14 @@ CCometixLine 支持通过 TOML 文件和交互式 TUI 进行完整配置：
 | Git | 提交 SHA | `show_sha` | 关 |
 | 用量 | 5 小时限额的重置时间 | `show_reset_time` | 开 |
 | 用量 | 7 天限额的用量 | `show_seven_day` | 开 |
+| 用量 | 7 天限额的重置时间，显示在其用量之后 | `show_seven_day_reset` | 关 |
+| 用量 | Fable 每周限额的用量 | `show_fable` | 关 |
 | 用量 | API 地址 | `api_base_url` | `https://api.anthropic.com` |
 | 用量 | API 结果的缓存时长（秒） | `cache_duration` | 180 |
 | 用量 | API 超时（秒） | `timeout` | 2 |
 | 提示缓存 | 过期时间 | `show_expiry` | 开 |
 
-用量段只在 Claude Code 没有提供限额数据时查询用量 API：会话第一次响应之前，或使用较旧版本的 Claude Code 时。
+用量段只在 Claude Code 没有提供限额数据时查询用量 API：会话第一次响应之前，或使用较旧版本的 Claude Code 时。Claude Code 不提供 Fable 限额，因此开启 `show_fable` 后，用量段还会查询 API，其他限额仍使用 Claude Code 提供的数据。所有会话共用一份缓存，整台机器每个 `cache_duration` 内最多查询一次 API，请求失败或多个会话同时刷新时也是如此。API 连续三个 `cache_duration` 没有成功返回时，不再显示它上一次返回的数据。
 
 ### 模型配置 (`models.toml`)
 

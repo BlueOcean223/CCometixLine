@@ -152,7 +152,16 @@ impl PreviewComponent {
                 },
                 SegmentId::Usage => SegmentData {
                     primary: "24%".to_string(),
-                    secondary: shown(&[("show_reset_time", "14:00"), ("show_seven_day", "7d 41%")]),
+                    secondary: {
+                        let mut details =
+                            vec![("show_reset_time", "14:00"), ("show_seven_day", "7d 41%")];
+                        // The 7-day reset time follows the 7-day usage
+                        if segment_config.toggle("show_seven_day") {
+                            details.push(("show_seven_day_reset", "10-08 14:00"));
+                        }
+                        details.push(("show_fable", "Fable 12%"));
+                        shown(&details)
+                    },
                     metadata: HashMap::new(),
                 },
                 SegmentId::Cost => SegmentData {

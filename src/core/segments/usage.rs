@@ -5,41 +5,167 @@ use crate::utils::credentials;
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
+
+/// The usage API's cache file, shared by all sessions since they share the same limits
+const CACHE_FILE: &str = ".api_usage_cache.json";
+/// Held while a session checks and records when the API was last asked
+const LOCK_FILE: &str = ".api_usage_cache.lock";
+/// Cached usage stays on show for this many `cache_duration`s, so that a failed request
+/// or two keep the last answer, and longer failures hide it rather than show old usage
+const STALE_AFTER_REFRESHES: u64 = 3;
 
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
-    five_hour: UsagePeriod,
-    seven_day: UsagePeriod,
+    five_hour: Option<UsagePeriod>,
+    seven_day: Option<UsagePeriod>,
+    /// Limits beyond the two windows, among them the weekly window of each model
+    /// with a limit of its own. Entries vary in shape, so they are read one by one
+    #[serde(default)]
+    limits: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsagePeriod {
     utilization: f64,
+    /// RFC 3339
     resets_at: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct ApiUsageCache {
-    five_hour_utilization: f64,
-    seven_day_utilization: f64,
-    /// RFC 3339
-    #[serde(default)]
-    five_hour_resets_at: Option<String>,
-    cached_at: String,
+fn parse_rfc3339(s: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
-/// Utilization of both windows, 0 to 100, and when the five-hour window resets
-#[derive(Debug, PartialEq)]
+/// Whole seconds from `since` to `now`, or `None` when `since` is later, as after the
+/// clock is set back
+fn elapsed(since: DateTime<Utc>, now: DateTime<Utc>) -> Option<u64> {
+    u64::try_from((now - since).num_seconds()).ok()
+}
+
+impl ApiUsageResponse {
+    /// The weekly window of the Fable models, an entry of `limits` such as
+    /// `{"kind":"weekly_scoped","scope":{"model":{"display_name":"Fable"}},"percent":12.0}`
+    fn fable(&self) -> Option<ModelUsage> {
+        self.limits.iter().find_map(|limit| {
+            let name = limit.pointer("/scope/model/display_name")?.as_str()?;
+            if limit.get("kind")?.as_str()? != "weekly_scoped"
+                || !name.to_lowercase().starts_with("fable")
+            {
+                return None;
+            }
+            // Epoch seconds or RFC 3339
+            let resets_at = match limit.get("resets_at") {
+                Some(serde_json::Value::Number(ts)) => {
+                    ts.as_i64().and_then(|ts| DateTime::from_timestamp(ts, 0))
+                }
+                Some(serde_json::Value::String(s)) => parse_rfc3339(s),
+                _ => None,
+            };
+            Some(ModelUsage {
+                name: name.to_string(),
+                utilization: limit.get("percent")?.as_f64()?,
+                resets_at,
+            })
+        })
+    }
+}
+
+impl From<ApiUsageResponse> for UsageSnapshot {
+    fn from(response: ApiUsageResponse) -> Self {
+        let fable = response.fable();
+        // As on stdin, a missing window has nothing used yet
+        let window = |period: Option<UsagePeriod>| {
+            period.map_or((0.0, None), |p| {
+                (
+                    p.utilization,
+                    p.resets_at.as_deref().and_then(parse_rfc3339),
+                )
+            })
+        };
+        let (five_hour, five_hour_resets_at) = window(response.five_hour);
+        let (seven_day, seven_day_resets_at) = window(response.seven_day);
+        Self {
+            five_hour,
+            seven_day,
+            five_hour_resets_at,
+            seven_day_resets_at,
+            fable,
+        }
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ApiUsageCache {
+    /// When the API was last asked, whether or not it answered
+    #[serde(default)]
+    attempted_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    usage: Option<CachedUsage>,
+}
+
+/// The usage API's last answer
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedUsage {
+    fetched_at: DateTime<Utc>,
+    #[serde(flatten)]
+    usage: UsageSnapshot,
+}
+
+impl CachedUsage {
+    /// The usage to show at `now`: none once the API has not confirmed it for several
+    /// refreshes, and nothing used in a window whose reset time has passed, as Claude
+    /// Code reports a window once it resets
+    fn at(self, now: DateTime<Utc>, cache_duration: u64) -> Option<UsageSnapshot> {
+        let age = elapsed(self.fetched_at, now)?;
+        if age > STALE_AFTER_REFRESHES.saturating_mul(cache_duration) {
+            return None;
+        }
+
+        let reset = |utilization: &mut f64, resets_at: &mut Option<DateTime<Utc>>| {
+            if resets_at.is_some_and(|at| at <= now) {
+                *utilization = 0.0;
+                *resets_at = None;
+            }
+        };
+        let mut usage = self.usage;
+        reset(&mut usage.five_hour, &mut usage.five_hour_resets_at);
+        reset(&mut usage.seven_day, &mut usage.seven_day_resets_at);
+        if let Some(fable) = &mut usage.fable {
+            reset(&mut fable.utilization, &mut fable.resets_at);
+        }
+        Some(usage)
+    }
+}
+
+/// The weekly window of a model with a limit of its own
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct ModelUsage {
+    /// The name the usage API gives the model, such as `Fable`
+    name: String,
+    /// 0 to 100
+    utilization: f64,
+    resets_at: Option<DateTime<Utc>>,
+}
+
+/// Utilization of both windows, 0 to 100, and when they reset
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct UsageSnapshot {
     five_hour: f64,
     seven_day: f64,
     five_hour_resets_at: Option<DateTime<Utc>>,
+    seven_day_resets_at: Option<DateTime<Utc>>,
+    /// Only the usage API reports it
+    fable: Option<ModelUsage>,
 }
 
 pub struct UsageSegment {
     show_reset_time: bool,
     show_seven_day: bool,
+    show_seven_day_reset: bool,
+    show_fable: bool,
 }
 
 impl Default for UsageSegment {
@@ -53,6 +179,8 @@ impl UsageSegment {
         Self {
             show_reset_time: true,
             show_seven_day: true,
+            show_seven_day_reset: false,
+            show_fable: false,
         }
     }
 
@@ -63,6 +191,16 @@ impl UsageSegment {
 
     pub fn with_seven_day(mut self, show_seven_day: bool) -> Self {
         self.show_seven_day = show_seven_day;
+        self
+    }
+
+    pub fn with_seven_day_reset(mut self, show_seven_day_reset: bool) -> Self {
+        self.show_seven_day_reset = show_seven_day_reset;
+        self
+    }
+
+    pub fn with_fable(mut self, show_fable: bool) -> Self {
+        self.show_fable = show_fable;
         self
     }
 
@@ -90,56 +228,78 @@ impl UsageSegment {
         // Claude Code drops a window once it resets, so a missing window has nothing used yet
         let utilization =
             |window: &Option<RateLimitWindow>| window.as_ref().map_or(0.0, |w| w.used_percentage);
+        let resets_at = |window: &Option<RateLimitWindow>| {
+            window
+                .as_ref()
+                .and_then(|w| w.resets_at)
+                .and_then(|ts| DateTime::from_timestamp(ts, 0))
+        };
 
         Some(UsageSnapshot {
             five_hour: utilization(&limits.five_hour),
             seven_day: utilization(&limits.seven_day),
-            five_hour_resets_at: limits
-                .five_hour
-                .as_ref()
-                .and_then(|w| w.resets_at)
-                .and_then(|ts| DateTime::from_timestamp(ts, 0)),
+            five_hour_resets_at: resets_at(&limits.five_hour),
+            seven_day_resets_at: resets_at(&limits.seven_day),
+            fable: None,
         })
     }
 
-    fn get_cache_path() -> Option<std::path::PathBuf> {
-        let home = dirs::home_dir()?;
-        Some(
-            home.join(".claude")
-                .join("ccline")
-                .join(".api_usage_cache.json"),
-        )
+    fn cache_dir() -> Option<PathBuf> {
+        Some(dirs::home_dir()?.join(".claude").join("ccline"))
     }
 
-    fn load_cache(&self) -> Option<ApiUsageCache> {
-        let cache_path = Self::get_cache_path()?;
-        if !cache_path.exists() {
-            return None;
-        }
-
-        let content = std::fs::read_to_string(&cache_path).ok()?;
+    fn load_cache(dir: &Path) -> Option<ApiUsageCache> {
+        let content = std::fs::read_to_string(dir.join(CACHE_FILE)).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    fn save_cache(&self, cache: &ApiUsageCache) {
-        if let Some(cache_path) = Self::get_cache_path() {
-            if let Some(parent) = cache_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(json) = serde_json::to_string_pretty(cache) {
-                let _ = std::fs::write(&cache_path, json);
-            }
+    /// Write through a temporary file, so that a session reading the cache meanwhile
+    /// gets the old or the new one, never a partial one
+    fn save_cache(dir: &Path, cache: &ApiUsageCache) {
+        let Ok(json) = serde_json::to_string_pretty(cache) else {
+            return;
+        };
+        let _ = std::fs::create_dir_all(dir);
+        let temp = dir.join(format!("{}.{}.tmp", CACHE_FILE, std::process::id()));
+        if std::fs::write(&temp, json).is_err()
+            || std::fs::rename(&temp, dir.join(CACHE_FILE)).is_err()
+        {
+            let _ = std::fs::remove_file(&temp);
         }
     }
 
-    fn is_cache_valid(&self, cache: &ApiUsageCache, cache_duration: u64) -> bool {
-        if let Ok(cached_at) = DateTime::parse_from_rfc3339(&cache.cached_at) {
-            let now = Utc::now();
-            let elapsed = now.signed_duration_since(cached_at.with_timezone(&Utc));
-            elapsed.num_seconds() < cache_duration as i64
-        } else {
-            false
+    /// Load the cache, and if the API was last asked `cache_duration` or more ago, record
+    /// that this process asks it now. Sessions take turns under a file lock, so of the
+    /// sessions that render at the same moment, as all of them do when a limit resets,
+    /// only one asks.
+    fn claim_request(dir: &Path, cache_duration: u64) -> (ApiUsageCache, bool) {
+        // Released when the file closes, also when Claude Code kills the process.
+        // Where locking fails, sessions go on without it
+        let _lock = Self::lock_cache(dir);
+        let mut cache = Self::load_cache(dir).unwrap_or_default();
+        let now = Utc::now();
+        let asked_recently = cache
+            .attempted_at
+            .and_then(|at| elapsed(at, now))
+            .is_some_and(|seconds| seconds < cache_duration);
+        if asked_recently {
+            return (cache, false);
         }
+        cache.attempted_at = Some(now);
+        Self::save_cache(dir, &cache);
+        (cache, true)
+    }
+
+    fn lock_cache(dir: &Path) -> Option<File> {
+        std::fs::create_dir_all(dir).ok()?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(LOCK_FILE))
+            .ok()?;
+        file.lock().ok()?;
+        Some(file)
     }
 
     /// The proxy in the `env` of the Claude Code settings that apply to the project
@@ -195,10 +355,9 @@ impl UsageSegment {
     }
 
     /// Query the OAuth usage API, with a file cache. Only needed when Claude Code
-    /// does not report `rate_limits` (before the first API response, or older versions).
+    /// does not report `rate_limits` (before the first API response, or older versions),
+    /// or for the Fable window, which Claude Code does not report.
     fn usage_from_api(&self, input: &InputData) -> Option<UsageSnapshot> {
-        let token = credentials::get_oauth_token()?;
-
         // Load config from file to get segment options
         let config = crate::config::Config::load().ok()?;
         let segment_config = config.segments.iter().find(|s| s.id == SegmentId::Usage)?;
@@ -213,36 +372,27 @@ impl UsageSegment {
             .as_u64()
             .unwrap_or_default();
 
-        let cache = match self.load_cache() {
-            Some(cache) if self.is_cache_valid(&cache, cache_duration) => cache,
-            cached_data => match self.fetch_api_usage(api_base_url, &token, timeout, input) {
-                Some(response) => {
-                    let cache = ApiUsageCache {
-                        five_hour_utilization: response.five_hour.utilization,
-                        seven_day_utilization: response.seven_day.utilization,
-                        five_hour_resets_at: response.five_hour.resets_at,
-                        cached_at: Utc::now().to_rfc3339(),
-                    };
-                    self.save_cache(&cache);
-                    cache
-                }
-                None => cached_data?,
-            },
-        };
-
-        Some(UsageSnapshot {
-            five_hour: cache.five_hour_utilization,
-            seven_day: cache.seven_day_utilization,
-            five_hour_resets_at: cache
-                .five_hour_resets_at
-                .as_deref()
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|dt| dt.with_timezone(&Utc)),
-        })
+        let dir = Self::cache_dir()?;
+        // The attempt is recorded before asking, so that a request that fails, times out,
+        // or is cut short when Claude Code cancels the render also waits `cache_duration`
+        let (mut cache, ask) = Self::claim_request(&dir, cache_duration);
+        if ask {
+            let response = credentials::get_oauth_token()
+                .and_then(|token| self.fetch_api_usage(api_base_url, &token, timeout, input));
+            if let Some(response) = response {
+                cache.usage = Some(CachedUsage {
+                    fetched_at: Utc::now(),
+                    usage: response.into(),
+                });
+                Self::save_cache(&dir, &cache);
+            }
+        }
+        cache.usage?.at(Utc::now(), cache_duration)
     }
 
     /// The five-hour window's usage, with the icon showing the same window and its
-    /// reset time, followed by the seven-day window's usage.
+    /// reset time, followed by the seven-day window's usage and reset time, then the
+    /// Fable window's usage.
     fn segment_data(&self, usage: &UsageSnapshot) -> SegmentData {
         let primary = format!("{}%", usage.five_hour.round() as u8);
         let mut details = Vec::new();
@@ -251,6 +401,24 @@ impl UsageSegment {
         }
         if self.show_seven_day {
             details.push(format!("7d {}%", usage.seven_day.round() as u8));
+            if let Some(resets_at) = usage
+                .seven_day_resets_at
+                .filter(|_| self.show_seven_day_reset)
+            {
+                details.push(
+                    resets_at
+                        .with_timezone(&Local)
+                        .format("%m-%d %H:%M")
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(fable) = usage.fable.as_ref().filter(|_| self.show_fable) {
+            details.push(format!(
+                "{} {}%",
+                fable.name,
+                fable.utilization.round() as u8
+            ));
         }
 
         let mut metadata = HashMap::new();
@@ -269,6 +437,15 @@ impl UsageSegment {
         if let Some(resets_at) = usage.five_hour_resets_at {
             metadata.insert("five_hour_resets_at".to_string(), resets_at.to_rfc3339());
         }
+        if let Some(resets_at) = usage.seven_day_resets_at {
+            metadata.insert("seven_day_resets_at".to_string(), resets_at.to_rfc3339());
+        }
+        if let Some(fable) = &usage.fable {
+            metadata.insert(
+                "fable_utilization".to_string(),
+                fable.utilization.to_string(),
+            );
+        }
 
         SegmentData {
             primary,
@@ -281,6 +458,11 @@ impl UsageSegment {
 impl Segment for UsageSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
         let usage = match Self::usage_from_input(input) {
+            // The windows Claude Code reports are newer than the API's, which only adds Fable
+            Some(usage) if self.show_fable => UsageSnapshot {
+                fable: self.usage_from_api(input).and_then(|api| api.fable),
+                ..usage
+            },
             Some(usage) => usage,
             None => self.usage_from_api(input)?,
         };
@@ -316,6 +498,8 @@ mod tests {
                 five_hour: 23.5,
                 seven_day: 41.2,
                 five_hour_resets_at: DateTime::from_timestamp(1738425600, 0),
+                seven_day_resets_at: DateTime::from_timestamp(1738857600, 0),
+                fable: None,
             }
         );
 
@@ -339,6 +523,164 @@ mod tests {
         );
         let segment = segment.with_reset_time(false);
         assert_eq!(segment.segment_data(&usage).secondary, "");
+    }
+
+    #[test]
+    fn seven_day_reset_time_follows_its_usage() {
+        let input = input(
+            r#","rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}"#,
+        );
+        let usage = UsageSegment::usage_from_input(&input).unwrap();
+        let reset = usage
+            .seven_day_resets_at
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%m-%d %H:%M");
+
+        let segment = UsageSegment::new()
+            .with_reset_time(false)
+            .with_seven_day_reset(true);
+        assert_eq!(
+            segment.segment_data(&usage).secondary,
+            format!("· 7d 41% · {}", reset)
+        );
+        // Without the usage it belongs to, the reset time is not shown either
+        let segment = segment.with_seven_day(false);
+        assert_eq!(segment.segment_data(&usage).secondary, "");
+    }
+
+    #[test]
+    fn reads_fable_from_api_limits() {
+        let response: ApiUsageResponse = serde_json::from_str(
+            r#"{"five_hour":null,"seven_day":{"utilization":41.0,"resets_at":"2026-10-08T14:00:00+00:00"},"limits":[
+                {"kind":"weekly_scoped","scope":{"model":null},"percent":5.0},
+                "unexpected",
+                {"kind":"daily","scope":{"model":{"display_name":"Fable"}},"percent":80.0},
+                {"kind":"weekly_scoped","scope":{"model":{"display_name":"Opus"}},"percent":30.0},
+                {"kind":"weekly_scoped","scope":{"model":{"display_name":"Fable"}},"percent":12.4,"resets_at":1791468000}
+            ]}"#,
+        )
+        .unwrap();
+        assert!(response.five_hour.is_none());
+        assert_eq!(
+            response.fable(),
+            Some(ModelUsage {
+                name: "Fable".to_string(),
+                utilization: 12.4,
+                resets_at: DateTime::from_timestamp(1791468000, 0),
+            })
+        );
+        let usage = UsageSnapshot::from(response);
+        assert_eq!(usage.five_hour, 0.0);
+        assert_eq!(
+            usage.seven_day_resets_at,
+            DateTime::from_timestamp(1791468000, 0)
+        );
+
+        let response: ApiUsageResponse = serde_json::from_str(
+            r#"{"five_hour":{"utilization":24.0,"resets_at":null},"seven_day":{"utilization":41.0,"resets_at":null}}"#,
+        )
+        .unwrap();
+        assert_eq!(response.fable(), None);
+    }
+
+    #[test]
+    fn sessions_rendering_together_ask_once() {
+        let dir = std::env::temp_dir().join(format!("ccline-usage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let dir = dir.clone();
+                std::thread::spawn(move || UsageSegment::claim_request(&dir, 180).1)
+            })
+            .collect();
+        let asked = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .filter(|&ask| ask)
+            .count();
+        assert_eq!(asked, 1);
+        // Within `cache_duration`, whether or not the API answered
+        assert!(!UsageSegment::claim_request(&dir, 180).1);
+        // A cache_duration of 0 asks every time
+        assert!(UsageSegment::claim_request(&dir, 0).1);
+
+        // A cache file from before `attempted_at` asks the API once
+        std::fs::write(
+            dir.join(CACHE_FILE),
+            r#"{"five_hour_utilization":24.0,"seven_day_utilization":41.0,"cached_at":"2026-10-05T12:00:00+00:00"}"#,
+        )
+        .unwrap();
+        assert!(UsageSegment::claim_request(&dir, 180).1);
+
+        let leftovers: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{:?}", leftovers);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cached_usage_ages_out_and_resets() {
+        let now = Utc::now();
+        let seconds = chrono::Duration::seconds;
+        let cached = |fetched_ago: i64| CachedUsage {
+            fetched_at: now - seconds(fetched_ago),
+            usage: UsageSnapshot {
+                five_hour: 87.0,
+                seven_day: 41.0,
+                five_hour_resets_at: Some(now - seconds(60)),
+                seven_day_resets_at: Some(now + seconds(3600)),
+                fable: Some(ModelUsage {
+                    name: "Fable".to_string(),
+                    utilization: 12.0,
+                    resets_at: Some(now),
+                }),
+            },
+        };
+
+        // Windows past their reset time have nothing used yet
+        let usage = cached(10).at(now, 180).unwrap();
+        assert_eq!((usage.five_hour, usage.five_hour_resets_at), (0.0, None));
+        assert_eq!(usage.seven_day, 41.0);
+        assert_eq!(usage.seven_day_resets_at, Some(now + seconds(3600)));
+        let fable = usage.fable.unwrap();
+        assert_eq!((fable.utilization, fable.resets_at), (0.0, None));
+
+        // Kept through two failed refreshes, hidden after the third
+        assert!(cached(540).at(now, 180).is_some());
+        assert!(cached(541).at(now, 180).is_none());
+        // Fetched after `now`, the clock has been set back
+        assert!(cached(-60).at(now, 180).is_none());
+    }
+
+    #[test]
+    fn fable_usage_is_an_option() {
+        let input = input(
+            r#","rate_limits":{"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}"#,
+        );
+        let usage = UsageSnapshot {
+            fable: Some(ModelUsage {
+                name: "Fable".to_string(),
+                utilization: 12.4,
+                resets_at: None,
+            }),
+            ..UsageSegment::usage_from_input(&input).unwrap()
+        };
+        assert_eq!(
+            UsageSegment::new().segment_data(&usage).secondary,
+            "· 7d 41%"
+        );
+        assert_eq!(
+            UsageSegment::new()
+                .with_fable(true)
+                .segment_data(&usage)
+                .secondary,
+            "· 7d 41% · Fable 12%"
+        );
     }
 
     #[test]

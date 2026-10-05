@@ -413,7 +413,9 @@ pub fn collect_all_segments(
             crate::config::SegmentId::Usage => {
                 let segment = UsageSegment::new()
                     .with_reset_time(segment_config.toggle("show_reset_time"))
-                    .with_seven_day(segment_config.toggle("show_seven_day"));
+                    .with_seven_day(segment_config.toggle("show_seven_day"))
+                    .with_seven_day_reset(segment_config.toggle("show_seven_day_reset"))
+                    .with_fable(segment_config.toggle("show_fable"));
                 segment.collect(input)
             }
             crate::config::SegmentId::Cost => {

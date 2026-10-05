@@ -225,7 +225,7 @@ Tokens in the context window and their share of the context limit, from the usag
 
 ### Usage Display
 
-For Claude subscriptions: the 5-hour limit's usage and when it resets, then the 7-day limit's usage, as in `24% · 14:00 · 7d 41%`.
+For Claude subscriptions: the 5-hour limit's usage and when it resets, then the 7-day limit's usage, as in `24% · 14:00 · 7d 41%`. Options can add when the 7-day limit resets and the usage of the weekly Fable limit, as in `24% · 14:00 · 7d 41% · 10-08 14:00 · Fable 12%`.
 
 ### Prompt Cache Display
 
@@ -265,12 +265,14 @@ In `ccline --config`, select a segment and press Tab: its options follow Text St
 | Git | Commit SHA | `show_sha` | off |
 | Usage | Reset time of the 5-hour limit | `show_reset_time` | on |
 | Usage | Usage of the 7-day limit | `show_seven_day` | on |
+| Usage | Reset time of the 7-day limit, shown after its usage | `show_seven_day_reset` | off |
+| Usage | Usage of the weekly Fable limit | `show_fable` | off |
 | Usage | API base URL | `api_base_url` | `https://api.anthropic.com` |
 | Usage | API cache duration, in seconds | `cache_duration` | 180 |
 | Usage | API timeout, in seconds | `timeout` | 2 |
 | Prompt Cache | Expiry time | `show_expiry` | on |
 
-The Usage segment queries the usage API only when Claude Code does not report rate limits: before a session's first response, or with older Claude Code versions.
+The Usage segment queries the usage API only when Claude Code does not report rate limits: before a session's first response, or with older Claude Code versions. Claude Code does not report the Fable limit, so with `show_fable` on, the segment also queries the API and shows the other limits from Claude Code. All sessions share one cache, and the API is queried at most once per `cache_duration` on the machine, even when a request fails or several sessions refresh at the same moment. Once the API has not answered for three `cache_duration`s, its last answer is no longer shown.
 
 ### Model Configuration (`models.toml`)
 
