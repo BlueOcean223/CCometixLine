@@ -226,6 +226,9 @@ pub struct Model {
 #[derive(Deserialize)]
 pub struct Workspace {
     pub current_dir: String,
+    /// Where Claude Code was started, whose `.claude` directory holds the project's settings
+    #[serde(default, deserialize_with = "lenient")]
+    pub project_dir: Option<String>,
 }
 
 #[derive(Deserialize)]

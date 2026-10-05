@@ -1,9 +1,11 @@
 use super::{join_details, Segment, SegmentData};
 use crate::config::{InputData, RateLimitWindow, SegmentId};
+use crate::utils::claude_settings::ClaudeSettings;
 use crate::utils::credentials;
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
@@ -140,20 +142,13 @@ impl UsageSegment {
         }
     }
 
-    fn get_proxy_from_settings() -> Option<String> {
-        let home = std::env::var("HOME")
-            .or_else(|_| std::env::var("USERPROFILE"))
-            .ok()?;
-        let settings_path = format!("{}/.claude/settings.json", home);
-
-        let content = std::fs::read_to_string(&settings_path).ok()?;
-        let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
-
+    /// The proxy in the `env` of the Claude Code settings that apply to the project
+    fn get_proxy_from_settings(project_dir: Option<&Path>) -> Option<String> {
+        let settings = ClaudeSettings::load(project_dir);
         // Try HTTPS_PROXY first, then HTTP_PROXY
         settings
-            .get("env")?
-            .get("HTTPS_PROXY")
-            .or_else(|| settings.get("env")?.get("HTTP_PROXY"))
+            .get(&["env", "HTTPS_PROXY"])
+            .or_else(|| settings.get(&["env", "HTTP_PROXY"]))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     }
@@ -163,15 +158,16 @@ impl UsageSegment {
         api_base_url: &str,
         token: &str,
         timeout_secs: u64,
-        claude_code_version: Option<&str>,
+        input: &InputData,
     ) -> Option<ApiUsageResponse> {
         let url = format!("{}/api/oauth/usage", api_base_url);
-        let user_agent = match claude_code_version {
+        let user_agent = match &input.version {
             Some(version) => format!("claude-code/{}", version),
             None => "claude-code".to_string(),
         };
 
-        let agent = if let Some(proxy_url) = Self::get_proxy_from_settings() {
+        let project_dir = input.workspace.project_dir.as_deref().map(Path::new);
+        let agent = if let Some(proxy_url) = Self::get_proxy_from_settings(project_dir) {
             if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
                 ureq::Agent::config_builder()
                     .proxy(Some(proxy))
@@ -200,7 +196,7 @@ impl UsageSegment {
 
     /// Query the OAuth usage API, with a file cache. Only needed when Claude Code
     /// does not report `rate_limits` (before the first API response, or older versions).
-    fn usage_from_api(&self, claude_code_version: Option<&str>) -> Option<UsageSnapshot> {
+    fn usage_from_api(&self, input: &InputData) -> Option<UsageSnapshot> {
         let token = credentials::get_oauth_token()?;
 
         // Load config from file to get segment options
@@ -219,21 +215,19 @@ impl UsageSegment {
 
         let cache = match self.load_cache() {
             Some(cache) if self.is_cache_valid(&cache, cache_duration) => cache,
-            cached_data => {
-                match self.fetch_api_usage(api_base_url, &token, timeout, claude_code_version) {
-                    Some(response) => {
-                        let cache = ApiUsageCache {
-                            five_hour_utilization: response.five_hour.utilization,
-                            seven_day_utilization: response.seven_day.utilization,
-                            five_hour_resets_at: response.five_hour.resets_at,
-                            cached_at: Utc::now().to_rfc3339(),
-                        };
-                        self.save_cache(&cache);
-                        cache
-                    }
-                    None => cached_data?,
+            cached_data => match self.fetch_api_usage(api_base_url, &token, timeout, input) {
+                Some(response) => {
+                    let cache = ApiUsageCache {
+                        five_hour_utilization: response.five_hour.utilization,
+                        seven_day_utilization: response.seven_day.utilization,
+                        five_hour_resets_at: response.five_hour.resets_at,
+                        cached_at: Utc::now().to_rfc3339(),
+                    };
+                    self.save_cache(&cache);
+                    cache
                 }
-            }
+                None => cached_data?,
+            },
         };
 
         Some(UsageSnapshot {
@@ -288,7 +282,7 @@ impl Segment for UsageSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
         let usage = match Self::usage_from_input(input) {
             Some(usage) => usage,
-            None => self.usage_from_api(input.version.as_deref())?,
+            None => self.usage_from_api(input)?,
         };
         Some(self.segment_data(&usage))
     }

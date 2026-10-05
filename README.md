@@ -233,7 +233,7 @@ The prompt cache hit ratio Claude Code reports, as in `92% · 14:32`: the share 
 
 ### Line Wrapping
 
-When the segments do not fit, the status line continues on the next line, breaking between segments. Claude Code gives the status line the terminal width minus 4 columns and the `statusLine.padding` setting on both sides; ccline reads the padding from `~/.claude/settings.json`.
+When the segments do not fit, the status line continues on the next line, breaking between segments. Claude Code gives the status line the terminal width minus 4 columns and the `statusLine.padding` setting on both sides. ccline reads the padding in Claude Code's order of precedence: the project's `.claude/settings.local.json` and `.claude/settings.json`, then `settings.json` in `CLAUDE_CONFIG_DIR` (`~/.claude` by default). Managed settings are not read.
 
 ## Configuration
 

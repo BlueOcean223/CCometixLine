@@ -1,4 +1,5 @@
 pub mod claude_code_patcher;
+pub mod claude_settings;
 pub mod credentials;
 pub mod session_cost;
 

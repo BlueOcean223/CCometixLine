@@ -5,6 +5,7 @@ use ccometixline::core::{
 };
 use ccometixline::ui::{MainMenu, MenuResult};
 use std::io::{self, IsTerminal};
+use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse_args();
@@ -70,9 +71,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let segments_data = collect_all_segments(&config, &input);
 
     // Render statusline, wrapped to the width Claude Code leaves for it
+    let project_dir = input.workspace.project_dir.as_deref().map(Path::new);
     let max_width = std::env::var("COLUMNS")
         .ok()
-        .and_then(|columns| status_line_width(&columns, status_line_padding()));
+        .and_then(|columns| status_line_width(&columns, status_line_padding(project_dir)));
     let generator = StatusLineGenerator::new(config).with_max_width(max_width);
     let statusline = generator.generate(segments_data);
 

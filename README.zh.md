@@ -225,7 +225,7 @@ Claude Code 报告的提示缓存命中率，例如 `92% · 14:32`，即主对�
 
 ### 自动换行
 
-一行放不下时，状态栏在段与段之间换到下一行。Claude Code 留给状态栏的宽度是终端宽度减去 4 列，再减去两侧的 `statusLine.padding`；ccline 从 `~/.claude/settings.json` 读取 padding。
+一行放不下时，状态栏在段与段之间换到下一行。Claude Code 留给状态栏的宽度是终端宽度减去 4 列，再减去两侧的 `statusLine.padding`。ccline 按 Claude Code 的设置优先级读取 padding：先读项目的 `.claude/settings.local.json` 和 `.claude/settings.json`，再读 `CLAUDE_CONFIG_DIR`（默认 `~/.claude`）下的 `settings.json`。不读取托管设置（managed settings）。
 
 ## 配置
 

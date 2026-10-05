@@ -1,5 +1,7 @@
 use crate::config::{AnsiColor, Config, SegmentConfig, StyleMode};
 use crate::core::segments::SegmentData;
+use crate::utils::claude_settings::ClaudeSettings;
+use std::path::Path;
 use unicode_width::UnicodeWidthStr;
 
 /// Display width of text in terminal columns, skipping escape sequences: CSI
@@ -44,12 +46,11 @@ pub fn status_line_width(columns: &str, padding: usize) -> Option<usize> {
         .filter(|&width| width > 0)
 }
 
-/// `statusLine.padding` in the user's Claude Code settings
-pub fn status_line_padding() -> usize {
-    dirs::home_dir()
-        .and_then(|home| std::fs::read_to_string(home.join(".claude").join("settings.json")).ok())
-        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
-        .and_then(|settings| settings.get("statusLine")?.get("padding")?.as_u64())
+/// `statusLine.padding` in the Claude Code settings that apply to the project
+pub fn status_line_padding(project_dir: Option<&Path>) -> usize {
+    ClaudeSettings::load(project_dir)
+        .get(&["statusLine", "padding"])
+        .and_then(|padding| padding.as_u64())
         .map_or(0, |padding| padding as usize)
 }
 
