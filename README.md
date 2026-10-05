@@ -221,7 +221,7 @@ When Claude Code reports them, the reasoning effort level and fast mode follow t
 
 ### Context Window Display
 
-Tokens in the context window and their share of the context limit, from the usage Claude Code reports after each response. A new session shows `-` until its first response.
+Tokens in the context window and their share of the context limit, from the usage Claude Code reports after each response. A new session shows `-` until its first response, and so does a session after `/compact`.
 
 ### Usage Display
 

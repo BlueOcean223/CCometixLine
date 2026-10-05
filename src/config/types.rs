@@ -657,6 +657,8 @@ pub struct Message {
 #[derive(Deserialize)]
 pub struct TranscriptEntry {
     pub r#type: Option<String>,
+    /// For `system` entries, such as `compact_boundary` written by `/compact`
+    pub subtype: Option<String>,
     pub message: Option<Message>,
     #[serde(rename = "leafUuid")]
     pub leaf_uuid: Option<String>,

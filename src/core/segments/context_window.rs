@@ -23,9 +23,10 @@ impl ContextWindowSegment {
 ///
 /// Tokens come from `context_window.current_usage`. While it is null (before the
 /// session's first API response and right after `/compact`), only the session's own
-/// transcript can stand in, which has usage when the session was resumed. Older
-/// Claude Code versions without `context_window` use the transcript fallback, which
-/// may also take usage from the project's latest session.
+/// transcript can stand in, which has usage when the session was resumed. Usage from
+/// before a compaction does not count, so `/compact` shows no usage until the next
+/// response. Older Claude Code versions without `context_window` use the transcript
+/// fallback, which may also take usage from the project's latest session.
 fn resolve_context(input: &InputData, model_config: &ModelConfig) -> (Option<u32>, u32) {
     let native = input.context_window.as_ref();
 
@@ -152,7 +153,8 @@ fn try_parse_transcript_file(path: &Path) -> Option<u32> {
         }
     }
 
-    // Normal case: find the last assistant message in current file
+    // Normal case: find the last assistant message in current file. Usage from before a
+    // compaction boundary describes the context that /compact replaced.
     for line in lines.iter().rev() {
         let line = line.trim();
         if line.is_empty() {
@@ -160,6 +162,11 @@ fn try_parse_transcript_file(path: &Path) -> Option<u32> {
         }
 
         if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(line) {
+            if entry.r#type.as_deref() == Some("system")
+                && entry.subtype.as_deref() == Some("compact_boundary")
+            {
+                return None;
+            }
             if entry.r#type.as_deref() == Some("assistant") {
                 if let Some(message) = &entry.message {
                     if let Some(raw_usage) = &message.usage {
@@ -392,6 +399,43 @@ mod tests {
         assert!(resolve_context(&session("new.jsonl", ""), &models)
             .0
             .is_some());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn usage_from_before_compact_does_not_count() {
+        let dir = std::env::temp_dir().join(format!("ccline-compact-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        let response = |tokens: u32| {
+            format!(
+                r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":{},"output_tokens":0}}}}}}"#,
+                tokens
+            )
+        };
+        // The last response, then what /compact appends: a boundary and the summary
+        let compacted = [
+            response(180_000),
+            r#"{"type":"system","subtype":"compact_boundary","content":"Conversation compacted"}"#
+                .to_string(),
+            r#"{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"Summary"}}"#
+                .to_string(),
+        ]
+        .join("\n");
+        let json = format!(
+            r#"{{"model":{{"id":"claude-opus-5-5","display_name":"Opus"}},"workspace":{{"current_dir":"/tmp"}},"transcript_path":"{}","context_window":{{"context_window_size":200000,"current_usage":null}}}}"#,
+            path.display()
+        );
+        let input: InputData = serde_json::from_str(&json).unwrap();
+        let models = ModelConfig::default();
+
+        fs::write(&path, format!("{}\n", compacted)).unwrap();
+        assert_eq!(resolve_context(&input, &models).0, None);
+        // A session resumed after its first response since /compact
+        fs::write(&path, format!("{}\n{}\n", compacted, response(30_000))).unwrap();
+        assert_eq!(resolve_context(&input, &models).0, Some(30_000));
 
         let _ = fs::remove_dir_all(&dir);
     }
