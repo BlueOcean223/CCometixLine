@@ -1,68 +1,133 @@
 use crate::config::{AnsiColor, Config, SegmentConfig, StyleMode};
 use crate::core::segments::SegmentData;
+use unicode_width::UnicodeWidthStr;
 
-/// Strip ANSI escape sequences and return visible text length
+/// Display width of text in terminal columns, skipping escape sequences: CSI
+/// (`ESC [ ... final byte`, used for colors) and OSC (`ESC ] ... BEL` or
+/// `ESC ] ... ESC \`, used for hyperlinks).
 fn visible_width(text: &str) -> usize {
     let mut visible = String::new();
-    let mut in_escape = false;
     let mut chars = text.chars().peekable();
-
     while let Some(ch) = chars.next() {
-        if ch == '\x1b' {
-            // Start of ANSI escape sequence
-            in_escape = true;
-            // Skip the [ character
-            if chars.peek() == Some(&'[') {
-                chars.next();
-            }
-        } else if in_escape {
-            // Skip until we find the end of the escape sequence (letter)
-            if ch.is_alphabetic() {
-                in_escape = false;
-            }
-        } else {
-            // Regular character
+        if ch != '\x1b' {
             visible.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' || (c == '\x1b' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
     }
+    visible.width()
+}
 
-    visible.chars().count()
+/// Columns available to the status line. Claude Code passes the terminal width in
+/// `COLUMNS` and keeps 4 columns plus the `statusLine.padding` setting on both
+/// sides for itself; it cuts longer lines off (measured with Claude Code 2.1.284).
+pub fn status_line_width(columns: &str, padding: usize) -> Option<usize> {
+    let columns: usize = columns.trim().parse().ok()?;
+    columns
+        .checked_sub(4 + 2 * padding)
+        .filter(|&width| width > 0)
+}
+
+/// `statusLine.padding` in the user's Claude Code settings
+pub fn status_line_padding() -> usize {
+    dirs::home_dir()
+        .and_then(|home| std::fs::read_to_string(home.join(".claude").join("settings.json")).ok())
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|settings| settings.get("statusLine")?.get("padding")?.as_u64())
+        .map_or(0, |padding| padding as usize)
 }
 
 pub struct StatusLineGenerator {
     config: Config,
+    max_width: Option<usize>,
 }
 
 impl StatusLineGenerator {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self {
+            config,
+            max_width: None,
+        }
+    }
+
+    /// Wrap lines between segments to fit `max_width` terminal columns
+    pub fn with_max_width(mut self, max_width: Option<usize>) -> Self {
+        self.max_width = max_width;
+        self
     }
 
     pub fn generate(&self, segments: Vec<(SegmentConfig, SegmentData)>) -> String {
-        let mut output = Vec::new();
-        let enabled_segments: Vec<_> = segments
-            .into_iter()
+        self.layout(&segments, self.max_width).join("\n")
+    }
+
+    /// Render the enabled segments and join them with separators. With a maximum
+    /// width, a new line starts before a segment that would make the line wider;
+    /// lines only break between segments.
+    fn layout(
+        &self,
+        segments: &[(SegmentConfig, SegmentData)],
+        max_width: Option<usize>,
+    ) -> Vec<String> {
+        let rendered: Vec<(&SegmentConfig, String)> = segments
+            .iter()
             .filter(|(config, _)| config.enabled)
+            .map(|(config, data)| (config, self.render_segment(config, data)))
+            .filter(|(_, text)| !text.is_empty())
             .collect();
 
-        for (config, data) in enabled_segments.iter() {
-            let rendered = self.render_segment(config, data);
-            if !rendered.is_empty() {
-                output.push(rendered);
+        let powerline = self.config.style.separator == "\u{e0b0}";
+        let mut lines = Vec::new();
+        let mut line = String::new();
+        let mut width = 0;
+        for (i, (config, text)) in rendered.iter().enumerate() {
+            let text_width = visible_width(text);
+            if i > 0 {
+                let separator = if powerline {
+                    // Arrow colored from the previous segment's background to this one's
+                    self.create_powerline_arrow(
+                        rendered[i - 1].0.colors.background.as_ref(),
+                        config.colors.background.as_ref(),
+                    )
+                } else {
+                    format!("\x1b[37m{}\x1b[0m", self.config.style.separator)
+                };
+                let separator_width = visible_width(&separator);
+                if max_width.is_some_and(|max| width + separator_width + text_width > max) {
+                    lines.push(std::mem::take(&mut line));
+                    width = 0;
+                } else {
+                    line.push_str(&separator);
+                    width += separator_width;
+                }
+            }
+            line.push_str(text);
+            width += text_width;
+        }
+        if !line.is_empty() {
+            lines.push(line);
+        }
+        if powerline {
+            for line in &mut lines {
+                line.push_str("\x1b[0m");
             }
         }
-
-        if output.is_empty() {
-            return String::new();
-        }
-
-        // Handle Powerline arrow separators with color transition
-        if self.config.style.separator == "\u{e0b0}" {
-            self.join_with_powerline_arrows(&output, &enabled_segments)
-        } else {
-            // For all other separators, use white color and simple join
-            self.join_with_white_separators(&output)
-        }
+        lines
     }
 
     /// Generate statusline for TUI preview with proper width calculation
@@ -96,102 +161,7 @@ impl StatusLineGenerator {
         use ansi_to_tui::IntoText;
         use ratatui::text::{Line, Span, Text};
 
-        let enabled_segments: Vec<_> = segments
-            .into_iter()
-            .filter(|(config, _)| config.enabled)
-            .collect();
-
-        if enabled_segments.is_empty() {
-            return Text::from(vec![Line::default()]);
-        }
-
-        // Render each segment individually
-        let mut rendered_segments = Vec::new();
-        let mut segment_configs = Vec::new();
-
-        for (config, data) in &enabled_segments {
-            let rendered = self.render_segment(config, data);
-            if !rendered.is_empty() {
-                rendered_segments.push(rendered);
-                segment_configs.push(config.clone());
-            }
-        }
-
-        if rendered_segments.is_empty() {
-            return Text::from(vec![Line::default()]);
-        }
-
-        // Pre-calculate separators between segments
-        let mut separators = Vec::new();
-        for i in 0..rendered_segments.len().saturating_sub(1) {
-            let separator = if self.config.style.separator == "\u{e0b0}" {
-                // Powerline arrows with color transition
-                let prev_bg = segment_configs
-                    .get(i)
-                    .and_then(|config| config.colors.background.as_ref());
-                let curr_bg = segment_configs
-                    .get(i + 1)
-                    .and_then(|config| config.colors.background.as_ref());
-                self.create_powerline_arrow(prev_bg, curr_bg)
-            } else {
-                // Regular separators with white color
-                format!("\x1b[37m{}\x1b[0m", self.config.style.separator)
-            };
-            separators.push(separator);
-        }
-
-        // Intelligent line wrapping by segment
-        let mut lines: Vec<String> = Vec::new();
-        let mut current_line = String::new();
-        let mut current_width = 0usize;
-        let max_w = max_width as usize;
-
-        for i in 0..rendered_segments.len() {
-            let segment = &rendered_segments[i];
-            let segment_width = visible_width(segment);
-
-            // Check if adding this segment would exceed max_width
-            if current_width > 0 && current_width + segment_width > max_w {
-                // Current line would overflow, start a new line
-                lines.push(current_line.clone());
-                current_line.clear();
-                current_width = 0;
-            }
-
-            // Add the segment to current line
-            current_line.push_str(segment);
-            current_width += segment_width;
-
-            // Handle separator if not the last segment
-            if i < separators.len() {
-                let separator = &separators[i];
-                let separator_width = visible_width(separator);
-
-                // Check if next segment exists
-                if i + 1 < rendered_segments.len() {
-                    let next_segment = &rendered_segments[i + 1];
-                    let next_width = visible_width(next_segment);
-
-                    // Check if separator AND next segment both fit
-                    if current_width + separator_width + next_width <= max_w {
-                        // Both fit, add separator and continue on same line
-                        current_line.push_str(separator);
-                        current_width += separator_width;
-                    } else {
-                        // Separator and/or next segment don't fit
-                        // Don't add separator, just break line
-                        lines.push(current_line.clone());
-                        current_line.clear();
-                        current_width = 0;
-                    }
-                }
-            }
-        }
-
-        // Add the last line if it's not empty
-        if !current_line.is_empty() {
-            lines.push(current_line);
-        }
+        let lines = self.layout(&segments, Some(max_width as usize));
 
         // Convert string lines to ratatui Text
         let mut tui_lines = Vec::new();
@@ -356,53 +326,6 @@ impl StatusLineGenerator {
         }
     }
 
-    /// Join segments with white separators (non-Powerline)
-    fn join_with_white_separators(&self, rendered_segments: &[String]) -> String {
-        if rendered_segments.is_empty() {
-            return String::new();
-        }
-
-        // Use white color for separator
-        let white_separator = format!("\x1b[37m{}\x1b[0m", self.config.style.separator);
-        rendered_segments.join(&white_separator)
-    }
-
-    /// Join segments with Powerline arrow separators with proper color transitions
-    fn join_with_powerline_arrows(
-        &self,
-        rendered_segments: &[String],
-        segment_configs: &[(SegmentConfig, SegmentData)],
-    ) -> String {
-        if rendered_segments.is_empty() {
-            return String::new();
-        }
-
-        if rendered_segments.len() == 1 {
-            return rendered_segments[0].clone();
-        }
-
-        let mut result = rendered_segments[0].clone();
-
-        for (i, _) in rendered_segments.iter().enumerate().skip(1) {
-            let prev_bg = segment_configs
-                .get(i - 1)
-                .and_then(|(config, _)| config.colors.background.as_ref());
-            let curr_bg = segment_configs
-                .get(i)
-                .and_then(|(config, _)| config.colors.background.as_ref());
-
-            // Create Powerline arrow with color transition
-            let arrow = self.create_powerline_arrow(prev_bg, curr_bg);
-
-            result.push_str(&arrow);
-            result.push_str(&rendered_segments[i]);
-        }
-
-        // Reset colors at the end
-        result.push_str("\x1b[0m");
-        result
-    }
-
     /// Create a Powerline arrow with proper color transition
     fn create_powerline_arrow(
         &self,
@@ -469,7 +392,16 @@ pub fn collect_all_segments(
 
         let segment_data = match segment_config.id {
             crate::config::SegmentId::Model => {
-                let segment = ModelSegment::new();
+                let option = |key: &str| {
+                    segment_config
+                        .options
+                        .get(key)
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(true)
+                };
+                let segment = ModelSegment::new()
+                    .with_effort(option("show_effort"))
+                    .with_fast_mode(option("show_fast_mode"));
                 segment.collect(input)
             }
             crate::config::SegmentId::Directory => {
@@ -509,6 +441,10 @@ pub fn collect_all_segments(
                 let segment = UpdateSegment::new();
                 segment.collect(input)
             }
+            crate::config::SegmentId::PromptCache => {
+                let segment = PromptCacheSegment::new();
+                segment.collect(input)
+            }
         };
 
         if let Some(data) = segment_data {
@@ -517,4 +453,72 @@ pub fn collect_all_segments(
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::themes::ThemePresets;
+    use std::collections::HashMap;
+
+    #[test]
+    fn width_skips_escape_sequences_and_counts_wide_characters() {
+        assert_eq!(visible_width("\x1b[1;38;2;1;2;3mabc\x1b[0m"), 3);
+        // OSC 8 hyperlinks, terminated by BEL or by ESC \
+        assert_eq!(
+            visible_width("\x1b]8;;https://github.com/a/b\x07link\x1b]8;;\x07"),
+            4
+        );
+        assert_eq!(visible_width("\x1b]8;;https://x\x1b\\t\x1b]8;;\x1b\\"), 1);
+        assert_eq!(visible_width("中文 💰"), 7);
+    }
+
+    #[test]
+    fn width_left_by_claude_code() {
+        assert_eq!(status_line_width("80", 0), Some(76));
+        assert_eq!(status_line_width("80", 2), Some(72));
+        assert_eq!(status_line_width("4", 0), None);
+        assert_eq!(status_line_width("", 0), None);
+    }
+
+    #[test]
+    fn wraps_between_segments_to_fit_the_width() {
+        for theme in ["default", "powerline-dark"] {
+            let config = ThemePresets::builtin_theme(theme);
+            let segments: Vec<_> = config
+                .segments
+                .iter()
+                .map(|segment| {
+                    let mut segment = segment.clone();
+                    segment.enabled = true;
+                    let data = SegmentData {
+                        primary: "x".repeat(10),
+                        secondary: String::new(),
+                        metadata: HashMap::new(),
+                    };
+                    (segment, data)
+                })
+                .collect();
+
+            let single = StatusLineGenerator::new(config.clone()).generate(segments.clone());
+            assert!(!single.contains('\n'), "{}", theme);
+            assert!(visible_width(&single) > 40, "{}", theme);
+
+            let wrapped = StatusLineGenerator::new(config)
+                .with_max_width(Some(40))
+                .generate(segments.clone());
+            let lines: Vec<&str> = wrapped.lines().collect();
+            assert!(lines.len() > 1, "{}", theme);
+            for line in &lines {
+                assert!(visible_width(line) <= 40, "{}: {:?}", theme, line);
+            }
+            // Every segment is still there
+            assert_eq!(
+                wrapped.matches(&"x".repeat(10)).count(),
+                segments.len(),
+                "{}",
+                theme
+            );
+        }
+    }
 }

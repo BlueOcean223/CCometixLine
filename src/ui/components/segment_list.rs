@@ -1,4 +1,4 @@
-use crate::config::{Config, SegmentId};
+use crate::config::Config;
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -47,17 +47,7 @@ impl SegmentListComponent {
             .map(|(i, segment)| {
                 let is_selected = i == selected_segment && *selected_panel == Panel::SegmentList;
                 let enabled_marker = if segment.enabled { "●" } else { "○" };
-                let segment_name = match segment.id {
-                    SegmentId::Model => "Model",
-                    SegmentId::Directory => "Directory",
-                    SegmentId::Git => "Git",
-                    SegmentId::ContextWindow => "Context Window",
-                    SegmentId::Usage => "Usage",
-                    SegmentId::Cost => "Cost",
-                    SegmentId::Session => "Session",
-                    SegmentId::OutputStyle => "Output Style",
-                    SegmentId::Update => "Update",
-                };
+                let segment_name = segment.id.name();
 
                 if is_selected {
                     // Selected item with colored cursor

@@ -1,4 +1,6 @@
 pub mod segments;
 pub mod statusline;
 
-pub use statusline::{collect_all_segments, StatusLineGenerator};
+pub use statusline::{
+    collect_all_segments, status_line_padding, status_line_width, StatusLineGenerator,
+};

@@ -1,4 +1,4 @@
-use crate::config::{Config, SegmentId, StyleMode};
+use crate::config::{Config, StyleMode};
 use crate::ui::components::{
     color_picker::{ColorPickerComponent, NavDirection},
     help::HelpComponent,
@@ -496,17 +496,7 @@ impl App {
                 // Toggle segment enabled/disabled in segment list
                 if let Some(segment) = self.config.segments.get_mut(self.selected_segment) {
                     segment.enabled = !segment.enabled;
-                    let segment_name = match segment.id {
-                        SegmentId::Model => "Model",
-                        SegmentId::Directory => "Directory",
-                        SegmentId::Git => "Git",
-                        SegmentId::ContextWindow => "Context Window",
-                        SegmentId::Usage => "Usage",
-                        SegmentId::Cost => "Cost",
-                        SegmentId::Session => "Session",
-                        SegmentId::OutputStyle => "Output Style",
-                        SegmentId::Update => "Update",
-                    };
+                    let segment_name = segment.id.name();
                     let is_enabled = segment.enabled;
                     self.status_message = Some(format!(
                         "{} segment {}",
@@ -523,17 +513,7 @@ impl App {
                         // Toggle enabled state in settings panel too
                         if let Some(segment) = self.config.segments.get_mut(self.selected_segment) {
                             segment.enabled = !segment.enabled;
-                            let segment_name = match segment.id {
-                                SegmentId::Model => "Model",
-                                SegmentId::Directory => "Directory",
-                                SegmentId::Git => "Git",
-                                SegmentId::ContextWindow => "Context Window",
-                                SegmentId::Usage => "Usage",
-                                SegmentId::Cost => "Cost",
-                                SegmentId::Session => "Session",
-                                SegmentId::OutputStyle => "Output Style",
-                                SegmentId::Update => "Update",
-                            };
+                            let segment_name = segment.id.name();
                             let is_enabled = segment.enabled;
                             self.status_message = Some(format!(
                                 "{} segment {}",

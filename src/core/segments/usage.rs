@@ -1,7 +1,7 @@
 use super::{Segment, SegmentData};
 use crate::config::{InputData, RateLimitWindow, SegmentId};
 use crate::utils::credentials;
-use chrono::{DateTime, Datelike, Duration, Local, Timelike, Utc};
+use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -21,12 +21,19 @@ struct UsagePeriod {
 struct ApiUsageCache {
     five_hour_utilization: f64,
     seven_day_utilization: f64,
-    resets_at: Option<String>,
+    /// RFC 3339
+    #[serde(default)]
+    five_hour_resets_at: Option<String>,
     cached_at: String,
 }
 
-/// `(five_hour_utilization, seven_day_utilization, seven_day_resets_at)`, utilization in 0-100
-type UsageSnapshot = (f64, f64, Option<DateTime<Utc>>);
+/// Utilization of both windows, 0 to 100, and when the five-hour window resets
+#[derive(Debug, PartialEq)]
+struct UsageSnapshot {
+    five_hour: f64,
+    seven_day: f64,
+    five_hour_resets_at: Option<DateTime<Utc>>,
+}
 
 #[derive(Default)]
 pub struct UsageSegment;
@@ -50,22 +57,6 @@ impl UsageSegment {
         }
     }
 
-    fn format_reset_time(reset_time: Option<DateTime<Utc>>) -> String {
-        if let Some(dt) = reset_time {
-            let mut local_dt = dt.with_timezone(&Local);
-            if local_dt.minute() > 45 {
-                local_dt += Duration::hours(1);
-            }
-            return format!(
-                "{}-{}-{}",
-                local_dt.month(),
-                local_dt.day(),
-                local_dt.hour()
-            );
-        }
-        "?".to_string()
-    }
-
     /// Rate limits reported by Claude Code on stdin.
     fn usage_from_input(input: &InputData) -> Option<UsageSnapshot> {
         let limits = input.rate_limits.as_ref()?;
@@ -76,17 +67,16 @@ impl UsageSegment {
         // Claude Code drops a window once it resets, so a missing window has nothing used yet
         let utilization =
             |window: &Option<RateLimitWindow>| window.as_ref().map_or(0.0, |w| w.used_percentage);
-        let resets_at = limits
-            .seven_day
-            .as_ref()
-            .and_then(|w| w.resets_at)
-            .and_then(|ts| DateTime::from_timestamp(ts, 0));
 
-        Some((
-            utilization(&limits.five_hour),
-            utilization(&limits.seven_day),
-            resets_at,
-        ))
+        Some(UsageSnapshot {
+            five_hour: utilization(&limits.five_hour),
+            seven_day: utilization(&limits.seven_day),
+            five_hour_resets_at: limits
+                .five_hour
+                .as_ref()
+                .and_then(|w| w.resets_at)
+                .and_then(|ts| DateTime::from_timestamp(ts, 0)),
+        })
     }
 
     fn get_cache_path() -> Option<std::path::PathBuf> {
@@ -211,83 +201,79 @@ impl UsageSegment {
             .and_then(|v| v.as_u64())
             .unwrap_or(2);
 
-        let cached_data = self.load_cache();
-        let use_cached = cached_data
-            .as_ref()
-            .map(|cache| self.is_cache_valid(cache, cache_duration))
-            .unwrap_or(false);
-
-        let (five_hour_util, seven_day_util, resets_at) = if use_cached {
-            let cache = cached_data.unwrap();
-            (
-                cache.five_hour_utilization,
-                cache.seven_day_utilization,
-                cache.resets_at,
-            )
-        } else {
-            match self.fetch_api_usage(api_base_url, &token, timeout, claude_code_version) {
-                Some(response) => {
-                    let cache = ApiUsageCache {
-                        five_hour_utilization: response.five_hour.utilization,
-                        seven_day_utilization: response.seven_day.utilization,
-                        resets_at: response.seven_day.resets_at.clone(),
-                        cached_at: Utc::now().to_rfc3339(),
-                    };
-                    self.save_cache(&cache);
-                    (
-                        response.five_hour.utilization,
-                        response.seven_day.utilization,
-                        response.seven_day.resets_at,
-                    )
-                }
-                None => {
-                    let cache = cached_data?;
-                    (
-                        cache.five_hour_utilization,
-                        cache.seven_day_utilization,
-                        cache.resets_at,
-                    )
+        let cache = match self.load_cache() {
+            Some(cache) if self.is_cache_valid(&cache, cache_duration) => cache,
+            cached_data => {
+                match self.fetch_api_usage(api_base_url, &token, timeout, claude_code_version) {
+                    Some(response) => {
+                        let cache = ApiUsageCache {
+                            five_hour_utilization: response.five_hour.utilization,
+                            seven_day_utilization: response.seven_day.utilization,
+                            five_hour_resets_at: response.five_hour.resets_at,
+                            cached_at: Utc::now().to_rfc3339(),
+                        };
+                        self.save_cache(&cache);
+                        cache
+                    }
+                    None => cached_data?,
                 }
             }
         };
 
-        let resets_at = resets_at
-            .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+        Some(UsageSnapshot {
+            five_hour: cache.five_hour_utilization,
+            seven_day: cache.seven_day_utilization,
+            five_hour_resets_at: cache
+                .five_hour_resets_at
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc)),
+        })
+    }
 
-        Some((five_hour_util, seven_day_util, resets_at))
+    /// The five-hour window's usage, with the icon showing the same window and its
+    /// reset time, followed by the seven-day window's usage.
+    fn segment_data(usage: &UsageSnapshot) -> SegmentData {
+        let primary = format!("{}%", usage.five_hour.round() as u8);
+        let mut details = Vec::new();
+        if let Some(resets_at) = usage.five_hour_resets_at {
+            details.push(resets_at.with_timezone(&Local).format("%H:%M").to_string());
+        }
+        details.push(format!("7d {}%", usage.seven_day.round() as u8));
+        let secondary = format!("· {}", details.join(" · "));
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "dynamic_icon".to_string(),
+            Self::get_circle_icon(usage.five_hour / 100.0),
+        );
+        metadata.insert(
+            "five_hour_utilization".to_string(),
+            usage.five_hour.to_string(),
+        );
+        metadata.insert(
+            "seven_day_utilization".to_string(),
+            usage.seven_day.to_string(),
+        );
+        if let Some(resets_at) = usage.five_hour_resets_at {
+            metadata.insert("five_hour_resets_at".to_string(), resets_at.to_rfc3339());
+        }
+
+        SegmentData {
+            primary,
+            secondary,
+            metadata,
+        }
     }
 }
 
 impl Segment for UsageSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
-        let (five_hour_util, seven_day_util, resets_at) = match Self::usage_from_input(input) {
+        let usage = match Self::usage_from_input(input) {
             Some(usage) => usage,
             None => self.usage_from_api(input.version.as_deref())?,
         };
-
-        let dynamic_icon = Self::get_circle_icon(seven_day_util / 100.0);
-        let five_hour_percent = five_hour_util.round() as u8;
-        let primary = format!("{}%", five_hour_percent);
-        let secondary = format!("· {}", Self::format_reset_time(resets_at));
-
-        let mut metadata = HashMap::new();
-        metadata.insert("dynamic_icon".to_string(), dynamic_icon);
-        metadata.insert(
-            "five_hour_utilization".to_string(),
-            five_hour_util.to_string(),
-        );
-        metadata.insert(
-            "seven_day_utilization".to_string(),
-            seven_day_util.to_string(),
-        );
-
-        Some(SegmentData {
-            primary,
-            secondary,
-            metadata,
-        })
+        Some(Self::segment_data(&usage))
     }
 
     fn id(&self) -> SegmentId {
@@ -312,10 +298,26 @@ mod tests {
         let input = input(
             r#","rate_limits":{"five_hour":{"used_percentage":23.5,"resets_at":1738425600},"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}"#,
         );
-        let (five_hour, seven_day, resets_at) = UsageSegment::usage_from_input(&input).unwrap();
-        assert_eq!(five_hour, 23.5);
-        assert_eq!(seven_day, 41.2);
-        assert_eq!(resets_at.unwrap().timestamp(), 1738857600);
+        let usage = UsageSegment::usage_from_input(&input).unwrap();
+        assert_eq!(
+            usage,
+            UsageSnapshot {
+                five_hour: 23.5,
+                seven_day: 41.2,
+                five_hour_resets_at: DateTime::from_timestamp(1738425600, 0),
+            }
+        );
+
+        // Number, icon and reset time all describe the five-hour window
+        let data = UsageSegment::segment_data(&usage);
+        let reset = usage
+            .five_hour_resets_at
+            .unwrap()
+            .with_timezone(&Local)
+            .format("%H:%M");
+        assert_eq!(data.primary, "24%");
+        assert_eq!(data.secondary, format!("· {} · 7d 41%", reset));
+        assert_eq!(data.metadata["dynamic_icon"], "\u{f0a9f}");
     }
 
     #[test]
@@ -323,8 +325,10 @@ mod tests {
         let input = input(
             r#","rate_limits":{"seven_day":{"used_percentage":41.2,"resets_at":1738857600}}"#,
         );
-        let (five_hour, _, _) = UsageSegment::usage_from_input(&input).unwrap();
-        assert_eq!(five_hour, 0.0);
+        let usage = UsageSegment::usage_from_input(&input).unwrap();
+        assert_eq!(usage.five_hour, 0.0);
+        assert_eq!(usage.five_hour_resets_at, None);
+        assert_eq!(UsageSegment::segment_data(&usage).secondary, "· 7d 41%");
     }
 
     #[test]

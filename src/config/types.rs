@@ -73,6 +73,25 @@ pub enum SegmentId {
     Session,
     OutputStyle,
     Update,
+    PromptCache,
+}
+
+impl SegmentId {
+    /// Name shown in the configuration UI
+    pub fn name(&self) -> &'static str {
+        match self {
+            SegmentId::Model => "Model",
+            SegmentId::Directory => "Directory",
+            SegmentId::Git => "Git",
+            SegmentId::ContextWindow => "Context Window",
+            SegmentId::Usage => "Usage",
+            SegmentId::Cost => "Cost",
+            SegmentId::Session => "Session",
+            SegmentId::OutputStyle => "Output Style",
+            SegmentId::Update => "Update",
+            SegmentId::PromptCache => "Prompt Cache",
+        }
+    }
 }
 
 // Legacy compatibility structure
@@ -158,6 +177,29 @@ pub struct RateLimitWindow {
     pub resets_at: Option<i64>,
 }
 
+/// Absent when the model does not support the effort parameter
+#[derive(Deserialize)]
+pub struct Effort {
+    /// `low`, `medium`, `high`, `xhigh` or `max`
+    pub level: String,
+}
+
+/// Prompt cache statistics of the main conversation, present after its first API response
+#[derive(Deserialize)]
+pub struct PromptCache {
+    /// Whether the cached prefix is still within its lifetime
+    #[serde(default)]
+    pub warm: bool,
+    /// Whether any response this session reported cache tokens. `false` when caching
+    /// is off or the provider does not report it
+    #[serde(default)]
+    pub caching_observed: bool,
+    /// Unix epoch seconds when the cached prefix goes cold
+    pub expires_at: Option<i64>,
+    /// Cache reads as a fraction of all input tokens this session, 0 to 1
+    pub hit_ratio: Option<f64>,
+}
+
 #[derive(Deserialize)]
 pub struct InputData {
     pub model: Model,
@@ -171,6 +213,12 @@ pub struct InputData {
     pub context_window: Option<ContextWindow>,
     #[serde(default, deserialize_with = "lenient")]
     pub rate_limits: Option<RateLimits>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub effort: Option<Effort>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub fast_mode: Option<bool>,
+    #[serde(default, deserialize_with = "lenient")]
+    pub prompt_cache: Option<PromptCache>,
 }
 
 /// Deserialize an optional field, treating a malformed value as absent so that
@@ -331,6 +379,27 @@ impl Config {
         true
     }
 
+    /// Add segments that the config lacks because an older version wrote it, so
+    /// that they can be enabled in the configuration UI. Each takes its place and
+    /// settings from the built-in theme and starts disabled.
+    pub fn add_missing_segments(&mut self) {
+        let preset = crate::ui::themes::ThemePresets::builtin_theme(&self.theme);
+        for (index, segment) in preset.segments.iter().enumerate() {
+            if self.segments.iter().any(|s| s.id == segment.id) {
+                continue;
+            }
+            // After the nearest segment that precedes it in the theme
+            let position = preset.segments[..index]
+                .iter()
+                .rev()
+                .find_map(|prev| self.segments.iter().position(|s| s.id == prev.id))
+                .map_or(0, |i| i + 1);
+            let mut segment = segment.clone();
+            segment.enabled = false;
+            self.segments.insert(position, segment);
+        }
+    }
+
     /// Check if current config has been modified from the selected theme
     pub fn is_modified_from_theme(&self) -> bool {
         !self.matches_theme(&self.theme)
@@ -478,4 +547,39 @@ pub struct TranscriptEntry {
     #[serde(rename = "parentUuid")]
     pub parent_uuid: Option<String>,
     pub summary: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::themes::ThemePresets;
+
+    #[test]
+    fn missing_segments_are_added_disabled_in_theme_order() {
+        let preset = ThemePresets::builtin_theme("nord");
+        // A config written before the prompt cache segment existed
+        let mut config = preset.clone();
+        config
+            .segments
+            .retain(|segment| segment.id != SegmentId::PromptCache);
+        for segment in &mut config.segments {
+            segment.enabled = true;
+        }
+
+        config.add_missing_segments();
+        let ids: Vec<_> = config.segments.iter().map(|s| s.id).collect();
+        let preset_ids: Vec<_> = preset.segments.iter().map(|s| s.id).collect();
+        assert_eq!(ids, preset_ids);
+        let added = config
+            .segments
+            .iter()
+            .find(|s| s.id == SegmentId::PromptCache)
+            .unwrap();
+        assert!(!added.enabled);
+
+        // Nothing changes once every segment is present
+        let before = config.segments.len();
+        config.add_missing_segments();
+        assert_eq!(config.segments.len(), before);
+    }
 }

@@ -1,6 +1,8 @@
 use ccometixline::cli::Cli;
 use ccometixline::config::{Config, InputData};
-use ccometixline::core::{collect_all_segments, StatusLineGenerator};
+use ccometixline::core::{
+    collect_all_segments, status_line_padding, status_line_width, StatusLineGenerator,
+};
 use ccometixline::ui::{MainMenu, MenuResult};
 use std::io::{self, IsTerminal};
 
@@ -67,8 +69,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Collect segment data
     let segments_data = collect_all_segments(&config, &input);
 
-    // Render statusline
-    let generator = StatusLineGenerator::new(config);
+    // Render statusline, wrapped to the width Claude Code leaves for it
+    let max_width = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|columns| status_line_width(&columns, status_line_padding()));
+    let generator = StatusLineGenerator::new(config).with_max_width(max_width);
     let statusline = generator.generate(segments_data);
 
     println!("{}", statusline);

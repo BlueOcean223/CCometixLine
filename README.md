@@ -217,9 +217,33 @@ Shows simplified Claude model names:
 - `claude-3-5-sonnet` → `Sonnet 3.5`
 - `claude-4-sonnet` → `Sonnet 4`
 
+When Claude Code reports them, the reasoning effort level and fast mode follow the name, as in `Opus 5.5 · high · fast`. To hide them, set these options on the model segment in `config.toml`:
+
+```toml
+[[segments]]
+id = "model"
+# ...
+
+[segments.options]
+show_effort = false
+show_fast_mode = false
+```
+
 ### Context Window Display
 
-Token usage percentage based on transcript analysis with context limit tracking.
+Tokens in the context window and their share of the context limit, from the usage Claude Code reports after each response. A new session shows `-` until its first response.
+
+### Usage Display
+
+For Claude subscriptions: the 5-hour limit's usage and when it resets, then the 7-day limit's usage, as in `24% · 14:00 · 7d 41%`.
+
+### Prompt Cache Display
+
+The prompt cache hit ratio Claude Code reports, as in `92% · 14:32`: the share of the main conversation's input tokens read from the cache. Claude Code counts from when it started, so resuming a session starts the count over, and subagents are not included. For Claude models it adds when the cache expires, or `cold` after it has. Claude Code works that out from Anthropic's cache lifetimes, so other providers' models show only the share. Disabled by default; enable it with `ccline --config`.
+
+### Line Wrapping
+
+When the segments do not fit, the status line continues on the next line, breaking between segments. Claude Code gives the status line the terminal width minus 4 columns and the `statusLine.padding` setting on both sides; ccline reads the padding from `~/.claude/settings.json`.
 
 ## Configuration
 
@@ -238,7 +262,7 @@ All segments are configurable with:
 - Color customization
 - Format options
 
-Supported segments: Directory, Git, Model, Usage, Time, Cost, OutputStyle
+Supported segments: Model, Directory, Git, Context Window, Usage, Cost, Prompt Cache, Session, Output Style
 
 ### Model Configuration (`models.toml`)
 

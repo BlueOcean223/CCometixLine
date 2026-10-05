@@ -17,7 +17,11 @@ impl ThemePresets {
             return config;
         }
 
-        // Fallback to built-in themes
+        Self::builtin_theme(theme_name)
+    }
+
+    /// A built-in theme, ignoring theme files; unknown names get the default theme
+    pub fn builtin_theme(theme_name: &str) -> Config {
         match theme_name {
             "cometix" => Self::get_cometix(),
             "default" => Self::get_default(),
@@ -46,6 +50,7 @@ impl ThemePresets {
 
         // Ensure the theme field matches the requested theme
         config.theme = theme_name.to_string();
+        config.add_missing_segments();
 
         Ok(config)
     }
@@ -135,6 +140,7 @@ impl ThemePresets {
                 theme_cometix::context_window_segment(),
                 theme_cometix::usage_segment(),
                 theme_cometix::cost_segment(),
+                theme_cometix::prompt_cache_segment(),
                 theme_cometix::session_segment(),
                 theme_cometix::output_style_segment(),
             ],
@@ -155,6 +161,7 @@ impl ThemePresets {
                 theme_default::context_window_segment(),
                 theme_default::usage_segment(),
                 theme_default::cost_segment(),
+                theme_default::prompt_cache_segment(),
                 theme_default::session_segment(),
                 theme_default::output_style_segment(),
             ],
@@ -175,6 +182,7 @@ impl ThemePresets {
                 theme_minimal::context_window_segment(),
                 theme_minimal::usage_segment(),
                 theme_minimal::cost_segment(),
+                theme_minimal::prompt_cache_segment(),
                 theme_minimal::session_segment(),
                 theme_minimal::output_style_segment(),
             ],
@@ -195,6 +203,7 @@ impl ThemePresets {
                 theme_gruvbox::context_window_segment(),
                 theme_gruvbox::usage_segment(),
                 theme_gruvbox::cost_segment(),
+                theme_gruvbox::prompt_cache_segment(),
                 theme_gruvbox::session_segment(),
                 theme_gruvbox::output_style_segment(),
             ],
@@ -215,6 +224,7 @@ impl ThemePresets {
                 theme_nord::context_window_segment(),
                 theme_nord::usage_segment(),
                 theme_nord::cost_segment(),
+                theme_nord::prompt_cache_segment(),
                 theme_nord::session_segment(),
                 theme_nord::output_style_segment(),
             ],
@@ -235,6 +245,7 @@ impl ThemePresets {
                 theme_powerline_dark::context_window_segment(),
                 theme_powerline_dark::usage_segment(),
                 theme_powerline_dark::cost_segment(),
+                theme_powerline_dark::prompt_cache_segment(),
                 theme_powerline_dark::session_segment(),
                 theme_powerline_dark::output_style_segment(),
             ],
@@ -255,6 +266,7 @@ impl ThemePresets {
                 theme_powerline_light::context_window_segment(),
                 theme_powerline_light::usage_segment(),
                 theme_powerline_light::cost_segment(),
+                theme_powerline_light::prompt_cache_segment(),
                 theme_powerline_light::session_segment(),
                 theme_powerline_light::output_style_segment(),
             ],
@@ -275,6 +287,7 @@ impl ThemePresets {
                 theme_powerline_rose_pine::context_window_segment(),
                 theme_powerline_rose_pine::usage_segment(),
                 theme_powerline_rose_pine::cost_segment(),
+                theme_powerline_rose_pine::prompt_cache_segment(),
                 theme_powerline_rose_pine::session_segment(),
                 theme_powerline_rose_pine::output_style_segment(),
             ],
@@ -295,6 +308,7 @@ impl ThemePresets {
                 theme_powerline_tokyo_night::context_window_segment(),
                 theme_powerline_tokyo_night::usage_segment(),
                 theme_powerline_tokyo_night::cost_segment(),
+                theme_powerline_tokyo_night::prompt_cache_segment(),
                 theme_powerline_tokyo_night::session_segment(),
                 theme_powerline_tokyo_night::output_style_segment(),
             ],

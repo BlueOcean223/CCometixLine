@@ -1,5 +1,5 @@
 use super::segment_list::{FieldSelection, Panel};
-use crate::config::{Config, SegmentId, StyleMode};
+use crate::config::{Config, StyleMode};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -26,17 +26,7 @@ impl SettingsComponent {
         selected_field: &FieldSelection,
     ) {
         if let Some(segment) = config.segments.get(selected_segment) {
-            let segment_name = match segment.id {
-                SegmentId::Model => "Model",
-                SegmentId::Directory => "Directory",
-                SegmentId::Git => "Git",
-                SegmentId::ContextWindow => "Context Window",
-                SegmentId::Usage => "Usage",
-                SegmentId::Cost => "Cost",
-                SegmentId::Session => "Session",
-                SegmentId::OutputStyle => "Output Style",
-                SegmentId::Update => "Update",
-            };
+            let segment_name = segment.id.name();
             let current_icon = match config.style.mode {
                 StyleMode::Plain => &segment.icon.plain,
                 StyleMode::NerdFont | StyleMode::Powerline => &segment.icon.nerd_font,

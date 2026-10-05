@@ -258,3 +258,33 @@ pub fn usage_segment() -> SegmentConfig {
         },
     }
 }
+
+pub fn prompt_cache_segment() -> SegmentConfig {
+    SegmentConfig {
+        id: SegmentId::PromptCache,
+        enabled: false,
+        icon: IconConfig {
+            plain: "💾".to_string(),
+            nerd_font: "\u{f1c0}".to_string(),
+        },
+        colors: ColorConfig {
+            icon: Some(AnsiColor::Rgb {
+                r: 115,
+                g: 218,
+                b: 202,
+            }),
+            text: Some(AnsiColor::Rgb {
+                r: 115,
+                g: 218,
+                b: 202,
+            }),
+            background: Some(AnsiColor::Rgb {
+                r: 34,
+                g: 36,
+                b: 54,
+            }),
+        },
+        styles: TextStyleConfig::default(),
+        options: HashMap::new(),
+    }
+}

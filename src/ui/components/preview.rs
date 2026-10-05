@@ -97,7 +97,10 @@ impl PreviewComponent {
             let mock_data = match segment_config.id {
                 SegmentId::Model => SegmentData {
                     primary: "Sonnet 4".to_string(),
-                    secondary: "".to_string(),
+                    secondary: match segment_config.options.get("show_effort") {
+                        Some(serde_json::Value::Bool(false)) => String::new(),
+                        _ => "· high".to_string(),
+                    },
                     metadata: {
                         let mut map = HashMap::new();
                         map.insert("model".to_string(), "claude-4-sonnet-20250512".to_string());
@@ -138,7 +141,7 @@ impl PreviewComponent {
                 },
                 SegmentId::Usage => SegmentData {
                     primary: "24%".to_string(),
-                    secondary: "· 10-7-2".to_string(),
+                    secondary: "· 14:00 · 7d 41%".to_string(),
                     metadata: HashMap::new(),
                 },
                 SegmentId::Cost => SegmentData {
@@ -167,6 +170,16 @@ impl PreviewComponent {
                     metadata: {
                         let mut map = HashMap::new();
                         map.insert("style_name".to_string(), "default".to_string());
+                        map
+                    },
+                },
+                SegmentId::PromptCache => SegmentData {
+                    primary: "92%".to_string(),
+                    secondary: "· 14:32".to_string(),
+                    metadata: {
+                        let mut map = HashMap::new();
+                        map.insert("hit_ratio".to_string(), "0.92".to_string());
+                        map.insert("warm".to_string(), "true".to_string());
                         map
                     },
                 },

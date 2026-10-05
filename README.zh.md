@@ -209,9 +209,33 @@ ccline --patch ~/.local/share/fnm/node-versions/v24.4.1/installation/lib/node_mo
 - `claude-3-5-sonnet` → `Sonnet 3.5`
 - `claude-4-sonnet` → `Sonnet 4`
 
+Claude Code 提供推理档位（effort）和快速模式时，会显示在模型名后面，例如 `Opus 5.5 · high · fast`。不想显示可以在 `config.toml` 的模型段里关掉：
+
+```toml
+[[segments]]
+id = "model"
+# ...
+
+[segments.options]
+show_effort = false
+show_fast_mode = false
+```
+
 ### 上下文窗口显示
 
-基于转录文件分析的令牌使用百分比，包含上下文限制跟踪。
+上下文窗口中的 token 数及其占上下文上限的比例，数据来自 Claude Code 每次响应后报告的用量。新会话在第一次响应前显示 `-`。
+
+### 用量显示
+
+适用于 Claude 订阅：5 小时限额的已用比例和重置时间，以及 7 天限额的已用比例，例如 `24% · 14:00 · 7d 41%`。
+
+### 提示缓存显示
+
+Claude Code 报告的提示缓存命中率，例如 `92% · 14:32`，即主对话的输入 token 中从缓存读取的比例。Claude Code 从启动时开始累计，恢复会话会重新计算，也不包括子代理。Claude 模型还会显示缓存的过期时间，过期后显示 `cold`。这个时间是 Claude Code 按 Anthropic 的缓存有效期算的，所以其他厂商的模型只显示比例。默认关闭，可在 `ccline --config` 中开启。
+
+### 自动换行
+
+一行放不下时，状态栏在段与段之间换到下一行。Claude Code 留给状态栏的宽度是终端宽度减去 4 列，再减去两侧的 `statusLine.padding`；ccline 从 `~/.claude/settings.json` 读取 padding。
 
 ## 配置
 
@@ -230,7 +254,7 @@ CCometixLine 支持通过 TOML 文件和交互式 TUI 进行完整配置：
 - 颜色自定义
 - 格式选项
 
-支持的段落：目录、Git、模型、使用量、时间、成本、输出样式
+支持的段落：模型、目录、Git、上下文窗口、用量、费用、提示缓存、会话、输出样式
 
 ### 模型配置 (`models.toml`)
 
