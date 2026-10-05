@@ -21,9 +21,11 @@ impl ContextWindowSegment {
 /// auto-compact, a smaller one by API errors. Claude Code reports its window as
 /// `context_window_size`; older versions infer it from the model ID.
 ///
-/// Tokens come from `context_window.current_usage`, falling back to the transcript on
-/// older Claude Code versions or while `current_usage` is null (e.g. a resumed session
-/// before its first API response).
+/// Tokens come from `context_window.current_usage`. While it is null (before the
+/// session's first API response and right after `/compact`), only the session's own
+/// transcript can stand in, which has usage when the session was resumed. Older
+/// Claude Code versions without `context_window` use the transcript fallback, which
+/// may also take usage from the project's latest session.
 fn resolve_context(input: &InputData, model_config: &ModelConfig) -> (Option<u32>, u32) {
     let native = input.context_window.as_ref();
 
@@ -36,10 +38,14 @@ fn resolve_context(input: &InputData, model_config: &ModelConfig) -> (Option<u32
         None => claude_code_limit,
     };
 
-    let tokens = native
-        .and_then(|cw| cw.current_usage.as_ref())
-        .map(|usage| usage.context_tokens())
-        .or_else(|| parse_transcript_usage(&input.transcript_path));
+    let tokens = match native {
+        Some(cw) => cw
+            .current_usage
+            .as_ref()
+            .map(|usage| usage.context_tokens())
+            .or_else(|| try_parse_transcript_file(Path::new(&input.transcript_path))),
+        None => parse_transcript_usage(&input.transcript_path),
+    };
 
     (tokens, context_limit)
 }
@@ -349,15 +355,45 @@ mod tests {
     }
 
     #[test]
-    fn null_current_usage_falls_back_to_transcript() {
-        let input = input(
-            "claude-opus-5-5",
-            r#","context_window":{"context_window_size":1000000,"current_usage":null}"#,
-        );
+    fn null_current_usage_reads_only_this_sessions_transcript() {
+        let dir = std::env::temp_dir().join(format!("ccline-context-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let usage = |tokens: u32| {
+            format!(
+                r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":{},"output_tokens":0}}}}}}"#,
+                tokens
+            ) + "\n"
+        };
+        fs::write(dir.join("other.jsonl"), usage(350_000)).unwrap();
+        fs::write(dir.join("resumed.jsonl"), usage(1_000)).unwrap();
+        let session = |name: &str, context_window: &str| -> InputData {
+            let json = format!(
+                r#"{{"model":{{"id":"claude-opus-5-5","display_name":"Opus"}},"workspace":{{"current_dir":"/tmp"}},"transcript_path":"{}"{}}}"#,
+                dir.join(name).display(),
+                context_window
+            );
+            serde_json::from_str(&json).unwrap()
+        };
+        let null_usage = r#","context_window":{"context_window_size":200000,"current_usage":null}"#;
+        let models = ModelConfig::default();
+
+        // A new session has no transcript yet, and other sessions say nothing about it
         assert_eq!(
-            resolve_context(&input, &ModelConfig::default()),
-            (None, 1_000_000)
+            resolve_context(&session("new.jsonl", null_usage), &models).0,
+            None
         );
+        // A resumed session before its first response
+        assert_eq!(
+            resolve_context(&session("resumed.jsonl", null_usage), &models).0,
+            Some(1_000)
+        );
+        // Versions without context_window keep the project history fallback
+        assert!(resolve_context(&session("new.jsonl", ""), &models)
+            .0
+            .is_some());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
