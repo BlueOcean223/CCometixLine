@@ -18,25 +18,35 @@ impl Segment for CostSegment {
         // Claude Code prices models it does not know at Claude Opus rates, so models
         // with configured prices are priced from the session's transcripts instead
         let models = ModelConfig::load();
-        let configured = models.get_pricing(&input.model.id).and_then(|pricing| {
-            let cost = session_cost(Path::new(&input.transcript_path), models, &pricing.currency)?;
-            Some((cost, pricing.currency.clone(), "models_toml"))
+        let configured = models.get_pricing(&input.model.id).map(|pricing| {
+            let cost = session_cost(Path::new(&input.transcript_path), models, &pricing.currency);
+            (
+                cost.total,
+                pricing.currency.clone(),
+                "models_toml",
+                cost.unpriced,
+            )
         });
-        let (cost, currency, source) = match configured {
+        let (cost, currency, source, unpriced) = match configured {
             Some(configured) => configured,
             None => (
                 input.cost.as_ref()?.total_cost_usd?,
                 "$".to_string(),
                 "claude_code",
+                0,
             ),
         };
 
         // Primary display: total cost
-        let primary = if cost < 0.01 {
+        let mut primary = if cost < 0.01 {
             format!("{}0", currency)
         } else {
             format!("{}{:.2}", currency, cost)
         };
+        // Some responses have no price in the currency, so the session cost more
+        if unpriced > 0 {
+            primary.push('+');
+        }
 
         // Secondary display: empty for cost segment
         let secondary = String::new();
@@ -45,6 +55,7 @@ impl Segment for CostSegment {
         metadata.insert("cost".to_string(), cost.to_string());
         metadata.insert("currency".to_string(), currency);
         metadata.insert("source".to_string(), source.to_string());
+        metadata.insert("unpriced_responses".to_string(), unpriced.to_string());
 
         Some(SegmentData {
             primary,

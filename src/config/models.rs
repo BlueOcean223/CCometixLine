@@ -2,7 +2,7 @@ use chrono::{DateTime, Datelike, FixedOffset, Timelike, Utc};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Third-party models with known context windows and prices, see the file for sources.
@@ -42,7 +42,20 @@ impl ModelEntry {
         let pattern = self.pattern.to_lowercase();
         match self.match_mode {
             MatchMode::Contains => model_id.to_lowercase().contains(&pattern),
-            MatchMode::Exact => strip_bracket_tags(model_id).to_lowercase() == pattern,
+            MatchMode::Exact => {
+                strip_bracket_tags(model_id).to_lowercase() == strip_bracket_tags(&pattern)
+            }
+        }
+    }
+
+    /// Like `matches`, but ignoring tags such as `[1m]` in the pattern too
+    fn matches_untagged(&self, model_id: &str) -> bool {
+        let model_id = strip_bracket_tags(model_id).to_lowercase();
+        let pattern = self.pattern.to_lowercase();
+        let pattern = strip_bracket_tags(&pattern);
+        match self.match_mode {
+            MatchMode::Contains => model_id.contains(pattern),
+            MatchMode::Exact => model_id == pattern,
         }
     }
 }
@@ -87,6 +100,7 @@ pub struct Rates {
     pub cache_write_1h: Option<f64>,
 }
 
+/// Cache prices a tier leaves out are the base ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricingTier {
     /// Applies when the request's input tokens (including cache reads and writes) reach this
@@ -100,10 +114,10 @@ pub struct PricingTier {
 pub struct OffPeak {
     /// Price multiplier outside the peak windows
     pub multiplier: f64,
-    /// Hours east of UTC that `peak_hours` are written in
+    /// Hours east of UTC that `peak_hours` are written in, such as 8 or 5.5
     #[serde(default)]
-    pub utc_offset: i32,
-    /// Full-price windows such as "09:00-12:00"
+    pub utc_offset: f64,
+    /// Full-price windows such as "09:00-12:00", or "22:00-02:00" across midnight
     pub peak_hours: Vec<String>,
     /// Peak windows apply Monday to Friday only
     #[serde(default)]
@@ -142,9 +156,18 @@ impl Pricing {
             .max_by_key(|tier| tier.min_input)
             .map_or(&self.rates, |tier| &tier.rates);
 
-        let cache_read = rates.cache_read.unwrap_or(rates.input);
-        let cache_write = rates.cache_write.unwrap_or(rates.input);
-        let cache_write_1h = rates.cache_write_1h.unwrap_or(cache_write);
+        let cache_read = rates
+            .cache_read
+            .or(self.rates.cache_read)
+            .unwrap_or(rates.input);
+        let cache_write = rates
+            .cache_write
+            .or(self.rates.cache_write)
+            .unwrap_or(rates.input);
+        let cache_write_1h = rates
+            .cache_write_1h
+            .or(self.rates.cache_write_1h)
+            .unwrap_or(cache_write);
         let cost = (usage.input as f64 * rates.input
             + usage.output as f64 * rates.output
             + usage.cache_read as f64 * cache_read
@@ -161,7 +184,7 @@ impl Pricing {
 
 impl OffPeak {
     fn is_peak(&self, at: DateTime<Utc>) -> bool {
-        let Some(offset) = FixedOffset::east_opt(self.utc_offset * 3600) else {
+        let Some(offset) = FixedOffset::east_opt((self.utc_offset * 3600.0).round() as i32) else {
             return true;
         };
         let local = at.with_timezone(&offset);
@@ -172,7 +195,13 @@ impl OffPeak {
         self.peak_hours
             .iter()
             .filter_map(|window| parse_window(window))
-            .any(|(start, end)| minute >= start && minute < end)
+            .any(|(start, end)| {
+                if start <= end {
+                    minute >= start && minute < end
+                } else {
+                    minute >= start || minute < end
+                }
+            })
     }
 }
 
@@ -180,7 +209,9 @@ impl OffPeak {
 fn parse_window(window: &str) -> Option<(u32, u32)> {
     let minutes = |time: &str| {
         let (hour, minute) = time.trim().split_once(':')?;
-        Some(hour.parse::<u32>().ok()? * 60 + minute.parse::<u32>().ok()?)
+        let (hour, minute) = (hour.parse::<u32>().ok()?, minute.parse::<u32>().ok()?);
+        let minutes = hour * 60 + minute;
+        (minute < 60 && minutes <= 24 * 60).then_some(minutes)
     };
     let (start, end) = window.split_once('-')?;
     Some((minutes(start)?, minutes(end)?))
@@ -315,15 +346,8 @@ impl ModelConfig {
             }
         }
 
-        // Try loading from user config directory first, then local
-        let config_paths = [
-            dirs::home_dir().map(|d| d.join(".claude").join("ccline").join("models.toml")),
-            Some(Path::new("models.toml").to_path_buf()),
-        ];
-
-        if let Some(config) = config_paths
+        if let Some(config) = Self::config_paths()
             .iter()
-            .flatten()
             .filter(|path| path.exists())
             .find_map(|path| Self::load_from_file(path).ok())
         {
@@ -331,6 +355,49 @@ impl ModelConfig {
         }
 
         model_config
+    }
+
+    /// Where `load` looks for models.toml: the user config directory first, then local
+    fn config_paths() -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = dirs::home_dir()
+            .map(|d| d.join(".claude").join("ccline").join("models.toml"))
+            .into_iter()
+            .collect();
+        paths.push(PathBuf::from("models.toml"));
+        paths
+    }
+
+    /// Check the first models.toml that `load` finds. `load` skips a file that does
+    /// not parse and reports nothing.
+    pub fn check() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(path) = Self::config_paths().into_iter().find(|path| path.exists()) else {
+            return Ok(());
+        };
+        let content = fs::read_to_string(&path)?;
+        let config: ModelConfig = toml::from_str(&content).map_err(|e| match e.span() {
+            Some(span) => {
+                let line = content.as_bytes()[..span.start.min(content.len())]
+                    .iter()
+                    .filter(|&&b| b == b'\n')
+                    .count()
+                    + 1;
+                format!("line {}: {}", line, e.message())
+            }
+            None => e.message().to_string(),
+        })?;
+        for entry in &config.model_entries {
+            let off_peak = entry.pricing.as_ref().and_then(|p| p.off_peak.as_ref());
+            for window in off_peak.iter().flat_map(|o| &o.peak_hours) {
+                if parse_window(window).is_none() {
+                    return Err(format!(
+                        "{}: peak hours \"{}\" are not HH:MM-HH:MM",
+                        entry.pattern, window
+                    )
+                    .into());
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Add a user configuration in front of this one.
@@ -402,9 +469,14 @@ impl ModelConfig {
             .filter(|suffix| !suffix.is_empty())
     }
 
-    /// Prices configured for the model.
+    /// Prices configured for the model. Tags such as `[1m]` are ignored, as Claude Code
+    /// strips them before calling the API, so that the model it reports and the same
+    /// model in its transcripts get the same prices.
     pub fn get_pricing(&self, model_id: &str) -> Option<&Pricing> {
-        self.entry_field(model_id, |entry| entry.pricing.as_ref())
+        self.model_entries
+            .iter()
+            .filter(|entry| entry.matches_untagged(model_id))
+            .find_map(|entry| entry.pricing.as_ref())
     }
 
     /// Create default model configuration file with minimal template
@@ -420,6 +492,8 @@ impl ModelConfig {
              # here to override them or to add other models.\n\
              \n\
              # Each [[models]] entry matches a model ID by substring, or exactly with\n\
+             # match = \"exact\". A substring also matches longer IDs: \"glm-5.3\" matches\n\
+             # \"glm-5.3-flash\" too, so override a single built-in model with\n\
              # match = \"exact\". Entries here take priority over built-in ones, and each\n\
              # field falls back to the next matching entry when left out.\n\
              #\n\
@@ -444,7 +518,8 @@ impl ModelConfig {
              # cache_write = 0.3       # 5-minute cache writes, defaults to input\n\
              # cache_write_1h = 0.6    # defaults to cache_write\n\
              #\n\
-             # # Higher rates once a request's input tokens reach min_input\n\
+             # # Higher rates once a request's input tokens reach min_input. Cache\n\
+             # # prices left out here are the ones above.\n\
              # [[models.pricing.tiers]]\n\
              # min_input = 32000\n\
              # input = 0.6\n\
@@ -453,7 +528,7 @@ impl ModelConfig {
              # # Discount outside peak hours\n\
              # [models.pricing.off_peak]\n\
              # multiplier = 0.5\n\
-             # utc_offset = 8\n\
+             # utc_offset = 8          # hours east of UTC that peak_hours are in, such as 5.5\n\
              # peak_hours = [\"09:00-12:00\", \"14:00-18:00\"]\n\
              # weekdays_only = true\n\
              \n\
@@ -605,6 +680,88 @@ mod tests {
         assert!(
             (large_cost - (1_000.0 * 10.0 + 140_000.0 * 1.0 + 100.0 * 40.0) / 1e6).abs() < 1e-12
         );
+    }
+
+    #[test]
+    fn tier_cache_prices_fall_back_to_the_base_ones() {
+        // The tier from the models.toml template, which leaves cache prices out
+        let pricing: Pricing = toml::from_str(
+            r#"
+            input = 0.3
+            output = 1.2
+            cache_read = 0.03
+
+            [[tiers]]
+            min_input = 32000
+            input = 0.6
+            output = 2.4
+            "#,
+        )
+        .unwrap();
+        let usage = TokenUsage {
+            input: 1_000,
+            cache_read: 100_000,
+            output: 500,
+            ..Default::default()
+        };
+        let expected = (1_000.0 * 0.6 + 500.0 * 2.4 + 100_000.0 * 0.03) / 1e6;
+        assert!((pricing.cost(&usage, None) - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn prices_ignore_tags_in_patterns() {
+        let mut config = ModelConfig::default();
+        config.merge(
+            toml::from_str(
+                r#"
+                [[models]]
+                pattern = "deepseek-v4-pro[1m]"
+                [models.pricing]
+                currency = "$"
+                input = 1.0
+                output = 2.0
+
+                [[models]]
+                pattern = "glm-5.1[1m]"
+                match = "exact"
+                display_name = "GLM"
+                "#,
+            )
+            .unwrap(),
+        );
+        // As Claude Code reports the model, and as its transcripts record it
+        assert_eq!(
+            config.get_pricing("deepseek-v4-pro[1m]").unwrap().currency,
+            "$"
+        );
+        assert_eq!(config.get_pricing("deepseek-v4-pro").unwrap().currency, "$");
+        // Exact patterns ignore tags on both sides
+        assert_eq!(config.get_display_name("glm-5.1").as_deref(), Some("GLM"));
+        assert_eq!(
+            config.get_display_name("glm-5.1[1m]").as_deref(),
+            Some("GLM")
+        );
+    }
+
+    #[test]
+    fn peak_hours_take_fractional_offsets_and_cross_midnight() {
+        let off_peak: OffPeak = toml::from_str(
+            r#"
+            multiplier = 0.5
+            utc_offset = 5.5
+            peak_hours = ["22:00-02:00"]
+            "#,
+        )
+        .unwrap();
+        // 23:30 and 01:00 in UTC+5:30 are peak, 03:00 is not
+        assert!(off_peak.is_peak(utc("2026-10-12T18:00:00Z").unwrap()));
+        assert!(off_peak.is_peak(utc("2026-10-12T19:30:00Z").unwrap()));
+        assert!(!off_peak.is_peak(utc("2026-10-12T21:30:00Z").unwrap()));
+
+        assert_eq!(parse_window("09:00-24:00"), Some((540, 1440)));
+        assert_eq!(parse_window("09:60-12:00"), None);
+        assert_eq!(parse_window("25:00-26:00"), None);
+        assert_eq!(parse_window("9-12"), None);
     }
 
     #[test]

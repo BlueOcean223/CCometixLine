@@ -278,15 +278,17 @@ The Usage segment queries the usage API only when Claude Code does not report ra
 
 Location: `~/.claude/ccline/models.toml` (auto-created on first run)
 
-This file configures model display names, context windows and prices. Claude models (Sonnet, Opus, Haiku) are automatically recognized with version extraction. Common third-party models (DeepSeek, GLM, Kimi, Qwen, MiniMax) are built in with their context windows and China-platform prices in CNY, see [`builtin_models.toml`](src/config/builtin_models.toml). Add entries here to override them (for example with USD prices from an international platform) or to add other models.
+This file configures model display names, context windows and prices. Claude models (Sonnet, Opus, Haiku) are automatically recognized with version extraction. Common third-party models (DeepSeek, GLM, Kimi, Qwen, MiniMax) are built in with their context windows and China-platform prices in CNY, see [`builtin_models.toml`](src/config/builtin_models.toml). Add entries here to override them (for example with USD prices from an international platform) or to add other models. Earlier versions also had built-in substring entries for `glm-4.5`, `kimi-k2` and `qwen3-coder` (128k to 256k windows); if you still use these models, add entries with their `context_limit`. Check Configuration in the `ccline` menu reports a `models.toml` that does not parse, which the status line otherwise ignores.
 
 - **Display name**: models without a configured name show Claude Code's model ID without tags such as `[1m]`.
 - **Context window**: the context segment uses the smaller of the model's `context_limit` and the window Claude Code works with. For a model ID it does not know, Claude Code uses 1M when the ID carries `[1m]`, otherwise the `CLAUDE_CODE_MAX_CONTEXT_TOKENS` environment variable, or 200k when that is unset. Claude Code compacts the conversation based on this window, so it should match the model's real window.
-- **Cost**: Claude Code prices models it does not know at Claude Opus rates. For models with `pricing`, the cost segment sums the session's transcripts (subagents included) at those prices instead. Requests Claude Code does not record in transcripts, such as session title generation, are not counted.
+- **Cost**: Claude Code prices models it does not know at Claude Opus rates. For models with `pricing`, the cost segment sums the session's transcripts (subagents and workflow agents included) at those prices instead. Responses from models without a price in the current model's currency are left out, and the cost then ends with `+`, as in `¥1.20+`. Requests Claude Code does not record in transcripts, such as session title generation, are not counted.
 - **Off-peak prices**: each request is priced at the time it was made. Public holidays are not tracked, so peak-hour requests on a weekday holiday are priced at peak rates.
 
 ```toml
 # Entries match the model ID by substring, or exactly with match = "exact".
+# A substring also matches longer IDs: "glm-5.3" matches "glm-5.3-flash" too,
+# so override a single built-in model with match = "exact".
 # They take priority over built-in entries; fields left out fall back to the next match.
 [[models]]
 pattern = "my-model"
@@ -302,7 +304,8 @@ cache_read = 0.03       # defaults to input
 cache_write = 0.3       # 5-minute cache writes, defaults to input
 cache_write_1h = 0.6    # defaults to cache_write
 
-# Higher rates once a request's input tokens (including cache) reach min_input
+# Higher rates once a request's input tokens (including cache) reach min_input.
+# Cache prices left out here are the ones above.
 [[models.pricing.tiers]]
 min_input = 32000
 input = 0.6
@@ -311,7 +314,7 @@ output = 2.4
 # Discount outside peak hours
 [models.pricing.off_peak]
 multiplier = 0.5
-utc_offset = 8
+utc_offset = 8          # hours east of UTC that peak_hours are in, such as 5.5
 peak_hours = ["09:00-12:00", "14:00-18:00"]
 weekdays_only = true
 

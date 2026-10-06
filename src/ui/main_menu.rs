@@ -150,29 +150,27 @@ impl MainMenu {
                 None // Stay in menu
             }
             2 => {
-                // Check config and show result in footer
-                match crate::config::Config::load() {
-                    Ok(config) => match config.check() {
-                        Ok(_) => {
-                            self.status_message = Some(StatusMessage {
-                                message: "✓ Configuration is valid!".to_string(),
-                                is_error: false,
-                            });
-                        }
-                        Err(e) => {
-                            self.status_message = Some(StatusMessage {
-                                message: format!("✗ Invalid: {}", e),
-                                is_error: true,
-                            });
-                        }
+                // Check config and models.toml, and show the result in footer
+                let result = match crate::config::Config::load() {
+                    Ok(config) => config
+                        .check()
+                        .map_err(|e| format!("✗ Invalid: {}", e))
+                        .and_then(|_| {
+                            crate::config::ModelConfig::check()
+                                .map_err(|e| format!("✗ Invalid models.toml: {}", e))
+                        }),
+                    Err(e) => Err(format!("✗ Failed to load: {}", e)),
+                };
+                self.status_message = Some(match result {
+                    Ok(_) => StatusMessage {
+                        message: "✓ Configuration is valid!".to_string(),
+                        is_error: false,
                     },
-                    Err(e) => {
-                        self.status_message = Some(StatusMessage {
-                            message: format!("✗ Failed to load: {}", e),
-                            is_error: true,
-                        });
-                    }
-                }
+                    Err(message) => StatusMessage {
+                        message,
+                        is_error: true,
+                    },
+                });
                 None // Stay in menu
             }
             3 => {

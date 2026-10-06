@@ -2,11 +2,13 @@
 //!
 //! Claude Code prices models it does not know at Claude Opus rates, which is far off
 //! for third-party models. When the current model has prices configured, the cost
-//! segment sums every API response in the session's transcripts instead. Requests
-//! Claude Code does not record in transcripts, such as session title generation,
-//! are not included.
+//! segment sums every API response in the session's transcripts instead. Responses
+//! whose model has no price in the current model's currency are left out of the sum
+//! and counted separately. Requests Claude Code does not record in transcripts, such
+//! as session title generation, are not included.
 
 use crate::config::{ModelConfig, Pricing, TokenUsage};
+use crate::utils::files::write_atomic;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -37,9 +39,16 @@ struct ScanCache {
     responses: HashMap<String, Response>,
 }
 
-/// Total cost of the session in `currency`, or `None` when a response has no price
-/// in that currency.
-pub fn session_cost(transcript_path: &Path, models: &ModelConfig, currency: &str) -> Option<f64> {
+/// Cost of a session's responses in one currency
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SessionCost {
+    pub total: f64,
+    /// Responses left out of `total`, as their model has no price in the currency
+    pub unpriced: usize,
+}
+
+/// Total cost of the session in `currency`.
+pub fn session_cost(transcript_path: &Path, models: &ModelConfig, currency: &str) -> SessionCost {
     let files = transcript_files(transcript_path);
     let cache_path = cache_path(transcript_path);
     let mut cache = cache_path
@@ -54,18 +63,30 @@ pub fn session_cost(transcript_path: &Path, models: &ModelConfig, currency: &str
     price(&cache.responses, models, currency)
 }
 
-/// The main transcript and its subagents' transcripts in `<session>/subagents/`.
+/// The main transcript and its subagents' transcripts under `<session>/subagents/`,
+/// where workflow agents' are in `workflows/<run>/`.
 fn transcript_files(transcript_path: &Path) -> Vec<PathBuf> {
     let mut files = vec![transcript_path.to_path_buf()];
-    if let Ok(entries) = fs::read_dir(transcript_path.with_extension("").join("subagents")) {
-        files.extend(
-            entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "jsonl")),
-        );
-    }
+    add_transcripts(
+        &transcript_path.with_extension("").join("subagents"),
+        &mut files,
+    );
     files
+}
+
+/// Add the `.jsonl` files in `dir` and its subdirectories.
+fn add_transcripts(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            add_transcripts(&path, files);
+        } else if path.extension().is_some_and(|ext| ext == "jsonl") {
+            files.push(path);
+        }
+    }
 }
 
 /// Read new lines from each file. Returns whether the cache changed.
@@ -77,13 +98,20 @@ fn scan(files: &[PathBuf], cache: &mut ScanCache) -> bool {
             .copied()
             .unwrap_or(0)
     };
-    // A file shorter than what was read has been rewritten: start over
+    // Start over when a file is shorter than what was read, as it has been rewritten, or
+    // when the cache has read files outside `files`, which belong to a session with the
+    // same ID in another project
     let rewritten = files
         .iter()
         .any(|path| fs::metadata(path).map_or(0, |m| m.len()) < offset(cache, path));
+    let foreign = cache.offsets.keys().any(|read| {
+        !files
+            .iter()
+            .any(|path| path.to_string_lossy() == read.as_str())
+    });
 
     let mut changed = false;
-    if cache.version != CACHE_VERSION || rewritten {
+    if cache.version != CACHE_VERSION || rewritten || foreign {
         *cache = ScanCache {
             version: CACHE_VERSION,
             ..Default::default()
@@ -132,6 +160,9 @@ struct Entry {
     #[serde(rename = "type")]
     kind: Option<String>,
     uuid: Option<String>,
+    /// Shared by the lines of one response, like the message ID
+    #[serde(rename = "requestId")]
+    request_id: Option<String>,
     timestamp: Option<DateTime<Utc>>,
     message: Option<Message>,
 }
@@ -176,7 +207,7 @@ fn parse_response(line: &[u8]) -> Option<(String, Response)> {
         .and_then(|c| c.ephemeral_1h_input_tokens)
         .unwrap_or(0)
         .min(cache_write);
-    let id = message.id.or(entry.uuid)?;
+    let id = message.id.or(entry.request_id).or(entry.uuid)?;
     Some((
         id,
         Response {
@@ -193,22 +224,27 @@ fn parse_response(line: &[u8]) -> Option<(String, Response)> {
     ))
 }
 
-/// Sum the responses' costs; `None` if a billable response has no price in `currency`.
+/// Sum the costs of the billable responses with a price in `currency`, and count the others.
 fn price(
     responses: &HashMap<String, Response>,
     models: &ModelConfig,
     currency: &str,
-) -> Option<f64> {
+) -> SessionCost {
     let mut pricing_by_model: HashMap<&str, Option<&Pricing>> = HashMap::new();
-    let mut total = 0.0;
+    let mut cost = SessionCost {
+        total: 0.0,
+        unpriced: 0,
+    };
     for response in responses.values().filter(|r| !r.usage.is_empty()) {
         let pricing = *pricing_by_model
             .entry(response.model.as_str())
             .or_insert_with(|| models.get_pricing(&response.model));
-        let pricing = pricing.filter(|p| p.currency == currency)?;
-        total += pricing.cost(&response.usage, response.timestamp);
+        match pricing.filter(|p| p.currency == currency) {
+            Some(pricing) => cost.total += pricing.cost(&response.usage, response.timestamp),
+            None => cost.unpriced += 1,
+        }
     }
-    Some(total)
+    cost
 }
 
 fn cache_path(transcript_path: &Path) -> Option<PathBuf> {
@@ -229,20 +265,11 @@ fn load_cache(path: &Path) -> Option<ScanCache> {
 }
 
 fn save_cache(path: &Path, cache: &ScanCache) {
-    let Some(dir) = path.parent() else {
-        return;
-    };
-    if !path.exists() {
+    if let Some(dir) = path.parent().filter(|_| !path.exists()) {
         prune_old_caches(dir);
     }
-    let _ = fs::create_dir_all(dir);
-    let Ok(json) = serde_json::to_vec(cache) else {
-        return;
-    };
-    // Write then rename, so a concurrent render never reads a partial file
-    let tmp = path.with_extension(format!("json.{}", std::process::id()));
-    if fs::write(&tmp, json).is_ok() && fs::rename(&tmp, path).is_err() {
-        let _ = fs::remove_file(&tmp);
+    if let Ok(json) = serde_json::to_vec(cache) {
+        let _ = write_atomic(path, &json);
     }
 }
 
@@ -282,43 +309,94 @@ mod tests {
     fn dedupes_lines_of_one_response() {
         let dir = std::env::temp_dir().join(format!("ccline-cost-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("session").join("subagents")).unwrap();
+        let subagents = dir.join("session").join("subagents");
+        fs::create_dir_all(subagents.join("workflows").join("run-1")).unwrap();
         let main = dir.join("session.jsonl");
-        // Two content blocks of one response, one user line, one subagent response
+        // Two content blocks of one response, one user line, then one response each
+        // from a subagent and a workflow agent
         let monday_peak = "2026-10-12T02:00:00Z";
         let content = line("a", "deepseek-flash", monday_peak, USAGE).repeat(2)
             + r#"{"type":"user","message":{"content":"hi"}}"#
             + "\n";
         fs::write(&main, content).unwrap();
         fs::write(
-            dir.join("session").join("subagents").join("agent-1.jsonl"),
+            subagents.join("agent-1.jsonl"),
             line("b", "deepseek-flash", monday_peak, USAGE),
+        )
+        .unwrap();
+        fs::write(
+            subagents
+                .join("workflows")
+                .join("run-1")
+                .join("agent-2.jsonl"),
+            line("c", "deepseek-flash", monday_peak, USAGE),
         )
         .unwrap();
 
         let mut cache = ScanCache::default();
         assert!(scan(&transcript_files(&main), &mut cache));
-        assert_eq!(cache.responses.len(), 2);
+        assert_eq!(cache.responses.len(), 3);
 
         let models = ModelConfig::default();
         let one = (248.0 * 2.0 + 2.0 * 8.0 + 11_904.0 * 0.04) / 1e6;
-        let total = price(&cache.responses, &models, "¥").unwrap();
-        assert!((total - 2.0 * one).abs() < 1e-12);
+        let cost = price(&cache.responses, &models, "¥");
+        assert!((cost.total - 3.0 * one).abs() < 1e-12);
+        assert_eq!(cost.unpriced, 0);
 
         // Only appended lines are read; a partial line waits for its newline
         let mut file = fs::OpenOptions::new().append(true).open(&main).unwrap();
-        file.write_all(line("c", "deepseek-flash", monday_peak, USAGE).as_bytes())
+        file.write_all(line("d", "deepseek-flash", monday_peak, USAGE).as_bytes())
             .unwrap();
         file.write_all(br#"{"type":"assistant","#).unwrap();
         assert!(scan(&transcript_files(&main), &mut cache));
-        assert_eq!(cache.responses.len(), 3);
+        assert_eq!(cache.responses.len(), 4);
         assert!(!scan(&transcript_files(&main), &mut cache));
 
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn unpriced_model_or_other_currency_gives_none() {
+    fn lines_without_a_message_id_are_keyed_by_request() {
+        let block = |uuid: &str| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{}","requestId":"req_1","message":{{"model":"deepseek-flash","usage":{}}}}}"#,
+                uuid, USAGE
+            )
+        };
+        let mut responses = HashMap::new();
+        for uuid in ["u1", "u2"] {
+            let (id, response) = parse_response(block(uuid).as_bytes()).unwrap();
+            responses.insert(id, response);
+        }
+        assert_eq!(responses.len(), 1);
+    }
+
+    #[test]
+    fn a_session_with_the_same_id_elsewhere_starts_over() {
+        let dir = std::env::temp_dir().join(format!("ccline-cost-id-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let monday_peak = "2026-10-12T02:00:00Z";
+        let session = |project: &str, id: &str| {
+            let path = dir.join(project).join("session.jsonl");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, line(id, "deepseek-flash", monday_peak, USAGE)).unwrap();
+            path
+        };
+        let first = session("project-a", "a");
+        let second = session("project-b", "b");
+
+        // Both transcripts share one cache file, as it is named after the session ID
+        let mut cache = ScanCache::default();
+        scan(&transcript_files(&first), &mut cache);
+        scan(&transcript_files(&second), &mut cache);
+        let ids: Vec<_> = cache.responses.keys().collect();
+        assert_eq!(ids, ["b"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unpriced_responses_are_left_out_and_counted() {
         let models = ModelConfig::default();
         let mut responses = HashMap::new();
         let usage = TokenUsage {
@@ -333,7 +411,6 @@ mod tests {
                 usage,
             },
         );
-        assert!(price(&responses, &models, "$").is_none());
         responses.insert(
             "b".to_string(),
             Response {
@@ -342,6 +419,11 @@ mod tests {
                 usage,
             },
         );
-        assert!(price(&responses, &models, "¥").is_none());
+        let cost = price(&responses, &models, "¥");
+        assert!((cost.total - 10.0 * 2.0 / 1e6).abs() < 1e-12);
+        assert_eq!(cost.unpriced, 1);
+        // No response has a price in another currency
+        let cost = price(&responses, &models, "$");
+        assert_eq!((cost.total, cost.unpriced), (0.0, 2));
     }
 }
