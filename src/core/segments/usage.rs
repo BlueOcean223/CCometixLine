@@ -2,33 +2,32 @@ use super::{join_details, Segment, SegmentData};
 use crate::config::{InputData, RateLimitWindow, SegmentId};
 use crate::utils::claude_settings::ClaudeSettings;
 use crate::utils::credentials;
+use crate::utils::files::write_atomic;
 use chrono::{DateTime, Local, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-/// The usage API's cache file, shared by all sessions since they share the same limits
-const CACHE_FILE: &str = ".api_usage_cache.json";
-/// Held while a session checks and records when the API was last asked
-const LOCK_FILE: &str = ".api_usage_cache.lock";
 /// Cached usage stays on show for this many `cache_duration`s, so that a failed request
 /// or two keep the last answer, and longer failures hide it rather than show old usage
 const STALE_AFTER_REFRESHES: u64 = 3;
+/// Longer timeouts are cut to this; ureq panics when the deadline overflows
+const MAX_TIMEOUT_SECS: u64 = 3600;
 
+/// The API's fields are nullable
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
     five_hour: Option<UsagePeriod>,
     seven_day: Option<UsagePeriod>,
     /// Limits beyond the two windows, among them the weekly window of each model
     /// with a limit of its own. Entries vary in shape, so they are read one by one
-    #[serde(default)]
-    limits: Vec<serde_json::Value>,
+    limits: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct UsagePeriod {
-    utilization: f64,
+    utilization: Option<f64>,
     /// RFC 3339
     resets_at: Option<String>,
 }
@@ -49,7 +48,8 @@ impl ApiUsageResponse {
     /// The weekly window of the Fable models, an entry of `limits` such as
     /// `{"kind":"weekly_scoped","scope":{"model":{"display_name":"Fable"}},"percent":12.0}`
     fn fable(&self) -> Option<ModelUsage> {
-        self.limits.iter().find_map(|limit| {
+        let limits = self.limits.as_ref().and_then(|limits| limits.as_array());
+        limits.into_iter().flatten().find_map(|limit| {
             let name = limit.pointer("/scope/model/display_name")?.as_str()?;
             if limit.get("kind")?.as_str()? != "weekly_scoped"
                 || !name.to_lowercase().starts_with("fable")
@@ -71,29 +71,32 @@ impl ApiUsageResponse {
             })
         })
     }
-}
 
-impl From<ApiUsageResponse> for UsageSnapshot {
-    fn from(response: ApiUsageResponse) -> Self {
-        let fable = response.fable();
-        // As on stdin, a missing window has nothing used yet
+    /// The usage the response reports, or `None` when it reports neither window, as
+    /// an error body from a relay may
+    fn snapshot(self) -> Option<UsageSnapshot> {
+        let fable = self.fable();
         let window = |period: Option<UsagePeriod>| {
-            period.map_or((0.0, None), |p| {
-                (
-                    p.utilization,
-                    p.resets_at.as_deref().and_then(parse_rfc3339),
-                )
-            })
+            let period = period?;
+            let resets_at = period.resets_at.as_deref().and_then(parse_rfc3339);
+            Some((period.utilization?, resets_at))
         };
-        let (five_hour, five_hour_resets_at) = window(response.five_hour);
-        let (seven_day, seven_day_resets_at) = window(response.seven_day);
-        Self {
+        let five_hour = window(self.five_hour);
+        let seven_day = window(self.seven_day);
+        if five_hour.is_none() && seven_day.is_none() {
+            return None;
+        }
+
+        // As on stdin, a missing window has nothing used yet
+        let (five_hour, five_hour_resets_at) = five_hour.unwrap_or((0.0, None));
+        let (seven_day, seven_day_resets_at) = seven_day.unwrap_or((0.0, None));
+        Some(UsageSnapshot {
             five_hour,
             seven_day,
             five_hour_resets_at,
             seven_day_resets_at,
             fable,
-        }
+        })
     }
 }
 
@@ -166,6 +169,11 @@ pub struct UsageSegment {
     show_seven_day: bool,
     show_seven_day_reset: bool,
     show_fable: bool,
+    api_base_url: String,
+    /// Seconds between requests to the usage API
+    cache_duration: u64,
+    /// Seconds to wait for the usage API
+    timeout: u64,
 }
 
 impl Default for UsageSegment {
@@ -181,7 +189,19 @@ impl UsageSegment {
             show_seven_day: true,
             show_seven_day_reset: false,
             show_fable: false,
+            api_base_url: "https://api.anthropic.com".to_string(),
+            cache_duration: 180,
+            timeout: 2,
         }
+    }
+
+    /// The usage API's base URL, and how many seconds to cache its answers and to wait
+    /// for one
+    pub fn with_api(mut self, base_url: &str, cache_duration: u64, timeout: u64) -> Self {
+        self.api_base_url = base_url.to_string();
+        self.cache_duration = cache_duration;
+        self.timeout = timeout;
+        self
     }
 
     pub fn with_reset_time(mut self, show_reset_time: bool) -> Self {
@@ -248,23 +268,24 @@ impl UsageSegment {
         Some(dirs::home_dir()?.join(".claude").join("ccline"))
     }
 
+    /// The usage API's cache file in `dir`, shared by the sessions of an account since
+    /// they share the same limits. An account in another Claude Code configuration
+    /// directory has its own.
+    fn cache_file(dir: &Path) -> PathBuf {
+        dir.join(format!(
+            ".api_usage_cache{}.json",
+            credentials::account_suffix()
+        ))
+    }
+
     fn load_cache(dir: &Path) -> Option<ApiUsageCache> {
-        let content = std::fs::read_to_string(dir.join(CACHE_FILE)).ok()?;
+        let content = std::fs::read_to_string(Self::cache_file(dir)).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    /// Write through a temporary file, so that a session reading the cache meanwhile
-    /// gets the old or the new one, never a partial one
     fn save_cache(dir: &Path, cache: &ApiUsageCache) {
-        let Ok(json) = serde_json::to_string_pretty(cache) else {
-            return;
-        };
-        let _ = std::fs::create_dir_all(dir);
-        let temp = dir.join(format!("{}.{}.tmp", CACHE_FILE, std::process::id()));
-        if std::fs::write(&temp, json).is_err()
-            || std::fs::rename(&temp, dir.join(CACHE_FILE)).is_err()
-        {
-            let _ = std::fs::remove_file(&temp);
+        if let Ok(json) = serde_json::to_string_pretty(cache) {
+            let _ = write_atomic(&Self::cache_file(dir), json.as_bytes());
         }
     }
 
@@ -290,13 +311,14 @@ impl UsageSegment {
         (cache, true)
     }
 
+    /// Held while a session checks and records when the API was last asked
     fn lock_cache(dir: &Path) -> Option<File> {
         std::fs::create_dir_all(dir).ok()?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
-            .open(dir.join(LOCK_FILE))
+            .open(Self::cache_file(dir).with_extension("lock"))
             .ok()?;
         file.lock().ok()?;
         Some(file)
@@ -313,14 +335,8 @@ impl UsageSegment {
             .map(|s| s.to_string())
     }
 
-    fn fetch_api_usage(
-        &self,
-        api_base_url: &str,
-        token: &str,
-        timeout_secs: u64,
-        input: &InputData,
-    ) -> Option<ApiUsageResponse> {
-        let url = format!("{}/api/oauth/usage", api_base_url);
+    fn fetch_api_usage(&self, token: &str, input: &InputData) -> Option<ApiUsageResponse> {
+        let url = format!("{}/api/oauth/usage", self.api_base_url);
         let user_agent = match &input.version {
             Some(version) => format!("claude-code/{}", version),
             None => "claude-code".to_string(),
@@ -346,7 +362,9 @@ impl UsageSegment {
             .header("anthropic-beta", "oauth-2025-04-20")
             .header("User-Agent", &user_agent)
             .config()
-            .timeout_global(Some(std::time::Duration::from_secs(timeout_secs)))
+            .timeout_global(Some(std::time::Duration::from_secs(
+                self.timeout.min(MAX_TIMEOUT_SECS),
+            )))
             .build()
             .call()
             .ok()?;
@@ -358,36 +376,41 @@ impl UsageSegment {
     /// does not report `rate_limits` (before the first API response, or older versions),
     /// or for the Fable window, which Claude Code does not report.
     fn usage_from_api(&self, input: &InputData) -> Option<UsageSnapshot> {
-        // Load config from file to get segment options
-        let config = crate::config::Config::load().ok()?;
-        let segment_config = config.segments.iter().find(|s| s.id == SegmentId::Usage)?;
-        let api_base_url = segment_config.option("api_base_url");
-        let api_base_url = api_base_url.as_str().unwrap_or_default();
-        let cache_duration = segment_config
-            .option("cache_duration")
-            .as_u64()
-            .unwrap_or_default();
-        let timeout = segment_config
-            .option("timeout")
-            .as_u64()
-            .unwrap_or_default();
-
         let dir = Self::cache_dir()?;
         // The attempt is recorded before asking, so that a request that fails, times out,
         // or is cut short when Claude Code cancels the render also waits `cache_duration`
-        let (mut cache, ask) = Self::claim_request(&dir, cache_duration);
+        let (mut cache, ask) = Self::claim_request(&dir, self.cache_duration);
         if ask {
-            let response = credentials::get_oauth_token()
-                .and_then(|token| self.fetch_api_usage(api_base_url, &token, timeout, input));
-            if let Some(response) = response {
-                cache.usage = Some(CachedUsage {
-                    fetched_at: Utc::now(),
-                    usage: response.into(),
-                });
-                Self::save_cache(&dir, &cache);
+            match credentials::get_oauth_token() {
+                Some(token) => {
+                    let usage = self
+                        .fetch_api_usage(&token, input)
+                        .and_then(ApiUsageResponse::snapshot);
+                    if let Some(usage) = usage {
+                        let usage = CachedUsage {
+                            fetched_at: Utc::now(),
+                            usage,
+                        };
+                        Self::store_usage(&dir, &mut cache, Some(usage));
+                    }
+                }
+                // Signed out, or signed in with an API key: the cached usage is that of
+                // the account signed in before
+                None if cache.usage.is_some() => Self::store_usage(&dir, &mut cache, None),
+                None => {}
             }
         }
-        cache.usage?.at(Utc::now(), cache_duration)
+        cache.usage?.at(Utc::now(), self.cache_duration)
+    }
+
+    /// Record the API's answer in the cache claimed before asking. Under the lock, so
+    /// that a later request recorded by another session is kept.
+    fn store_usage(dir: &Path, cache: &mut ApiUsageCache, usage: Option<CachedUsage>) {
+        let _lock = Self::lock_cache(dir);
+        let attempted_at = Self::load_cache(dir).and_then(|stored| stored.attempted_at);
+        cache.attempted_at = cache.attempted_at.max(attempted_at);
+        cache.usage = usage;
+        Self::save_cache(dir, cache);
     }
 
     /// The five-hour window's usage, with the icon showing the same window and its
@@ -570,7 +593,7 @@ mod tests {
                 resets_at: DateTime::from_timestamp(1791468000, 0),
             })
         );
-        let usage = UsageSnapshot::from(response);
+        let usage = response.snapshot().unwrap();
         assert_eq!(usage.five_hour, 0.0);
         assert_eq!(
             usage.seven_day_resets_at,
@@ -582,6 +605,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(response.fable(), None);
+    }
+
+    #[test]
+    fn api_responses_without_windows_are_not_used() {
+        let snapshot = |body: &str| {
+            serde_json::from_str::<ApiUsageResponse>(body)
+                .unwrap()
+                .snapshot()
+        };
+        assert_eq!(snapshot("{}"), None);
+        assert_eq!(snapshot(r#"{"error":{"type":"rate_limit_error"}}"#), None);
+        assert_eq!(
+            snapshot(r#"{"five_hour":null,"seven_day":{"utilization":null}}"#),
+            None
+        );
+
+        // Null or unexpected limits leave the windows readable
+        for limits in ["null", r#"{"kind":"weekly_scoped"}"#] {
+            let body = format!(
+                r#"{{"five_hour":{{"utilization":24.0,"resets_at":null}},"seven_day":null,"limits":{}}}"#,
+                limits
+            );
+            let usage = snapshot(&body).unwrap();
+            assert_eq!((usage.five_hour, usage.seven_day), (24.0, 0.0));
+            assert_eq!(usage.fable, None);
+        }
     }
 
     #[test]
@@ -608,7 +657,7 @@ mod tests {
 
         // A cache file from before `attempted_at` asks the API once
         std::fs::write(
-            dir.join(CACHE_FILE),
+            UsageSegment::cache_file(&dir),
             r#"{"five_hour_utilization":24.0,"seven_day_utilization":41.0,"cached_at":"2026-10-05T12:00:00+00:00"}"#,
         )
         .unwrap();

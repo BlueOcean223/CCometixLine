@@ -264,7 +264,7 @@ CCometixLine 支持通过 TOML 文件和交互式 TUI 进行完整配置：
 | 用量 | API 超时（秒） | `timeout` | 2 |
 | 提示缓存 | 过期时间 | `show_expiry` | 开 |
 
-用量段只在 Claude Code 没有提供限额数据时查询用量 API：会话第一次响应之前，或使用较旧版本的 Claude Code 时。Claude Code 不提供 Fable 限额，因此开启 `show_fable` 后，用量段还会查询 API，其他限额仍使用 Claude Code 提供的数据。所有会话共用一份缓存，整台机器每个 `cache_duration` 内最多查询一次 API，请求失败或多个会话同时刷新时也是如此。API 连续三个 `cache_duration` 没有成功返回时，不再显示它上一次返回的数据。
+用量段只在 Claude Code 没有提供限额数据时查询用量 API：会话第一次响应之前，或使用较旧版本的 Claude Code 时。Claude Code 不提供 Fable 限额，因此开启 `show_fable` 后，用量段还会查询 API，其他限额仍使用 Claude Code 提供的数据。`CLAUDE_CONFIG_DIR` 相同（即使用同一账号）的会话共用一份缓存，每个 `cache_duration` 内最多查询一次 API，请求失败或多个会话同时刷新时也是如此。API 连续三个 `cache_duration` 没有成功返回时，不再显示它上一次返回的数据。退出 Claude Code 登录或改用 API key 后，缓存的数据会在下一次该查询 API 时清除。
 
 ### 模型配置 (`models.toml`)
 

@@ -415,7 +415,21 @@ pub fn collect_all_segments(
                     .with_reset_time(segment_config.toggle("show_reset_time"))
                     .with_seven_day(segment_config.toggle("show_seven_day"))
                     .with_seven_day_reset(segment_config.toggle("show_seven_day_reset"))
-                    .with_fable(segment_config.toggle("show_fable"));
+                    .with_fable(segment_config.toggle("show_fable"))
+                    .with_api(
+                        segment_config
+                            .option("api_base_url")
+                            .as_str()
+                            .unwrap_or_default(),
+                        segment_config
+                            .option("cache_duration")
+                            .as_u64()
+                            .unwrap_or_default(),
+                        segment_config
+                            .option("timeout")
+                            .as_u64()
+                            .unwrap_or_default(),
+                    );
                 segment.collect(input)
             }
             crate::config::SegmentId::Cost => {

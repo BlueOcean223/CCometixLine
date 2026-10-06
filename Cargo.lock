@@ -216,6 +216,7 @@ dependencies = [
  "dirs",
  "ratatui",
  "regex",
+ "ring",
  "semver",
  "serde",
  "serde_json",

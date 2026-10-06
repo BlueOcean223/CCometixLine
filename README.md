@@ -272,7 +272,7 @@ In `ccline --config`, select a segment and press Tab: its options follow Text St
 | Usage | API timeout, in seconds | `timeout` | 2 |
 | Prompt Cache | Expiry time | `show_expiry` | on |
 
-The Usage segment queries the usage API only when Claude Code does not report rate limits: before a session's first response, or with older Claude Code versions. Claude Code does not report the Fable limit, so with `show_fable` on, the segment also queries the API and shows the other limits from Claude Code. All sessions share one cache, and the API is queried at most once per `cache_duration` on the machine, even when a request fails or several sessions refresh at the same moment. Once the API has not answered for three `cache_duration`s, its last answer is no longer shown.
+The Usage segment queries the usage API only when Claude Code does not report rate limits: before a session's first response, or with older Claude Code versions. Claude Code does not report the Fable limit, so with `show_fable` on, the segment also queries the API and shows the other limits from Claude Code. Sessions with the same `CLAUDE_CONFIG_DIR`, and so the same account, share a cache: the API is queried at most once per `cache_duration` for them, even when a request fails or several sessions refresh at the same moment. Once the API has not answered for three `cache_duration`s, its last answer is no longer shown. After you sign out of Claude Code or switch to an API key, the cached answer is cleared the next time the API is due.
 
 ### Model Configuration (`models.toml`)
 

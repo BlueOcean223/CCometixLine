@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct OAuthCredentials {
@@ -28,20 +28,52 @@ pub fn get_oauth_token() -> Option<String> {
     }
 }
 
+/// `CLAUDE_CONFIG_DIR`, when Claude Code runs with a configuration directory, and so an
+/// account, other than the default one
+fn custom_config_dir() -> Option<String> {
+    std::env::var("CLAUDE_CONFIG_DIR")
+        .ok()
+        .filter(|dir| !dir.is_empty())
+}
+
+/// What Claude Code appends to its keychain entry for the account in use: nothing for
+/// the default configuration directory, otherwise `-` and the first 8 hex digits of the
+/// SHA-256 of `CLAUDE_CONFIG_DIR`. Claude Code hashes the path in Unicode NFC, which
+/// ccline does not convert to.
+pub fn account_suffix() -> String {
+    suffix_for(custom_config_dir().as_deref())
+}
+
+fn suffix_for(config_dir: Option<&str>) -> String {
+    let Some(dir) = config_dir else {
+        return String::new();
+    };
+    let hash = ring::digest::digest(&ring::digest::SHA256, dir.as_bytes());
+    let hex: String = hash.as_ref()[..4]
+        .iter()
+        .map(|byte| format!("{:02x}", byte))
+        .collect();
+    format!("-{}", hex)
+}
+
 fn get_oauth_token_macos() -> Option<String> {
     use std::process::Command;
 
-    let user = std::env::var("USER").unwrap_or_else(|_| "user".to_string());
+    // The keychain account Claude Code uses
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .ok()
+        .filter(|user| {
+            !user.is_empty()
+                && user
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
+        .unwrap_or_else(|| "claude-code-user".to_string());
+    let service = format!("Claude Code-credentials{}", account_suffix());
 
     let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-a",
-            &user,
-            "-w",
-            "-s",
-            "Claude Code-credentials",
-        ])
+        .args(["find-generic-password", "-a", &user, "-w", "-s", &service])
         .output();
 
     match output {
@@ -61,32 +93,18 @@ fn get_oauth_token_macos() -> Option<String> {
     }
 }
 
+/// The credentials file in Claude Code's configuration directory. Only the directory in
+/// use is read, as another one holds another account's token.
 fn get_oauth_token_file() -> Option<String> {
-    // Try CLAUDE_CONFIG_DIR first if set (respects explicit user configuration)
-    if let Ok(config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        let config_path = PathBuf::from(config_dir).join(".credentials.json");
-        if let Some(token) = read_token_from_path(&config_path) {
-            return Some(token);
-        }
-    }
-
-    // Fall back to default ~/.claude/.credentials.json
-    if let Some(default_path) = get_credentials_path() {
-        if let Some(token) = read_token_from_path(&default_path) {
-            return Some(token);
-        }
-    }
-
-    None
-}
-
-fn get_credentials_path() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".claude").join(".credentials.json"))
+    let config_dir = match custom_config_dir() {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::home_dir()?.join(".claude"),
+    };
+    read_token_from_path(&config_dir.join(".credentials.json"))
 }
 
 /// Read OAuth token from a credentials file path
-fn read_token_from_path(path: &PathBuf) -> Option<String> {
+fn read_token_from_path(path: &Path) -> Option<String> {
     if !path.exists() {
         return None;
     }
@@ -95,4 +113,16 @@ fn read_token_from_path(path: &PathBuf) -> Option<String> {
     let creds_file: CredentialsFile = serde_json::from_str(&content).ok()?;
 
     creds_file.claude_ai_oauth.map(|oauth| oauth.access_token)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keychain_suffix_follows_claude_code() {
+        assert_eq!(suffix_for(None), "");
+        // sha256("/Users/x/.claude-work") starts with 74ed04d5
+        assert_eq!(suffix_for(Some("/Users/x/.claude-work")), "-74ed04d5");
+    }
 }
