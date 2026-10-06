@@ -485,9 +485,22 @@ impl Config {
 
     /// Add segments that the config lacks because an older version wrote it, so
     /// that they can be enabled in the configuration UI. Each takes its place and
-    /// settings from the built-in theme and starts disabled.
+    /// settings from the built-in theme and starts disabled. A theme of the user's
+    /// own uses the default theme, or the first built-in theme with its separator when
+    /// the default theme's differs, as segments of powerline and nord themes need a
+    /// background.
     pub fn add_missing_segments(&mut self) {
-        let preset = crate::ui::themes::ThemePresets::builtin_theme(&self.theme);
+        use crate::ui::themes::ThemePresets;
+        let themes = ThemePresets::get_available_themes();
+        let preset = if themes.iter().any(|(name, _)| *name == self.theme) {
+            ThemePresets::builtin_theme(&self.theme)
+        } else {
+            std::iter::once("default")
+                .chain(themes.iter().map(|(name, _)| *name))
+                .map(ThemePresets::builtin_theme)
+                .find(|theme| theme.style.separator == self.style.separator)
+                .unwrap_or_else(|| ThemePresets::builtin_theme("default"))
+        };
         for (index, segment) in preset.segments.iter().enumerate() {
             if self.segments.iter().any(|s| s.id == segment.id) {
                 continue;
@@ -691,6 +704,30 @@ mod tests {
         let before = config.segments.len();
         config.add_missing_segments();
         assert_eq!(config.segments.len(), before);
+    }
+
+    #[test]
+    fn segments_added_to_a_custom_theme_suit_its_separator() {
+        // Custom themes saved from built-in ones
+        for (base, background) in [
+            ("powerline-tokyo-night", true),
+            ("nord", true),
+            ("gruvbox", false),
+        ] {
+            let mut config = ThemePresets::builtin_theme(base);
+            config.theme = "my-theme".to_string();
+            config
+                .segments
+                .retain(|segment| segment.id != SegmentId::PromptCache);
+
+            config.add_missing_segments();
+            let added = config
+                .segments
+                .iter()
+                .find(|s| s.id == SegmentId::PromptCache)
+                .unwrap();
+            assert_eq!(added.colors.background.is_some(), background, "{}", base);
+        }
     }
 
     #[test]

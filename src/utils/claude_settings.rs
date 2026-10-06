@@ -4,9 +4,10 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 /// The Claude Code settings files that apply to a project, highest priority first:
-/// the project's `.claude/settings.local.json` and `.claude/settings.json`, then the
-/// user's `settings.json` in `CLAUDE_CONFIG_DIR` (`~/.claude` by default). Managed
-/// settings and files passed with `--settings` are not read.
+/// `.claude/settings.local.json` at the root of the git repository the project is
+/// in, then the project's own `.claude/settings.local.json` and `.claude/settings.json`,
+/// then the user's `settings.json` in `CLAUDE_CONFIG_DIR` (`~/.claude` by default).
+/// Managed settings and files passed with `--settings` are not read.
 pub struct ClaudeSettings {
     files: Vec<Value>,
 }
@@ -49,6 +50,18 @@ fn config_dir() -> Option<PathBuf> {
 fn settings_paths(project_dir: Option<&Path>, config_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(project) = project_dir {
+        // Claude Code keeps local settings at the repository root and still reads them
+        // from the project directory, below those. It skips the root when that is the
+        // home directory; it also skips a root the user does not own, which ccline
+        // does not check.
+        let home = dirs::home_dir();
+        let root = project
+            .ancestors()
+            .find(|dir| dir.join(".git").exists())
+            .filter(|&root| root != project && Some(root) != home.as_deref());
+        if let Some(root) = root {
+            paths.push(root.join(".claude").join("settings.local.json"));
+        }
         paths.push(project.join(".claude").join("settings.local.json"));
         paths.push(project.join(".claude").join("settings.json"));
     }
@@ -104,6 +117,44 @@ mod tests {
         fs::write(config.join("settings.json"), "{").unwrap();
         let settings = ClaudeSettings::read(&settings_paths(None, Some(&config)));
         assert_eq!(settings.get(&["statusLine", "padding"]), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_settings_come_from_the_repository_root_first() {
+        let dir = std::env::temp_dir().join(format!("ccline-root-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        let app = repo.join("app");
+        fs::create_dir_all(repo.join(".git")).unwrap();
+        fs::create_dir_all(repo.join(".claude")).unwrap();
+        fs::create_dir_all(app.join(".claude")).unwrap();
+        fs::write(
+            app.join(".claude").join("settings.local.json"),
+            r#"{"statusLine":{"padding":1},"env":{"HTTPS_PROXY":"http://app"}}"#,
+        )
+        .unwrap();
+        let padding = || {
+            ClaudeSettings::read(&settings_paths(Some(&app), None))
+                .get(&["statusLine", "padding"])
+                .cloned()
+        };
+
+        // Started in a subdirectory of the repository
+        assert_eq!(padding(), Some(Value::from(1)));
+        fs::write(
+            repo.join(".claude").join("settings.local.json"),
+            r#"{"statusLine":{"padding":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(padding(), Some(Value::from(2)));
+        // The project's own file still applies below the root's
+        let settings = ClaudeSettings::read(&settings_paths(Some(&app), None));
+        assert_eq!(
+            settings.get(&["env", "HTTPS_PROXY"]),
+            Some(&Value::from("http://app"))
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

@@ -229,11 +229,13 @@ For Claude subscriptions: the 5-hour limit's usage and when it resets, then the 
 
 ### Prompt Cache Display
 
-The prompt cache hit ratio Claude Code reports, as in `92% · 14:32`: the share of the main conversation's input tokens read from the cache. Claude Code counts from when it started, so resuming a session starts the count over, and subagents are not included. For Claude models it adds when the cache expires, or `cold` after it has. Claude Code works that out from Anthropic's cache lifetimes, so other providers' models show only the share. Disabled by default; enable it with `ccline --config`.
+The prompt cache hit ratio Claude Code reports, as in `92% · 14:32`: the share of the main conversation's input tokens read from the cache. Claude Code counts from when it started, so resuming a session starts the count over, and subagents are not included. For Claude models, including those Claude Code uses through Bedrock, Vertex AI or Foundry, it adds when the cache expires, or `cold` after it has. Claude Code works that out from Anthropic's cache lifetimes, so other providers' models show only the share. Disabled by default; enable it with `ccline --config`.
 
 ### Line Wrapping
 
-When the segments do not fit, the status line continues on the next line, breaking between segments. Claude Code gives the status line the terminal width minus 4 columns and the `statusLine.padding` setting on both sides. ccline reads the padding in Claude Code's order of precedence: the project's `.claude/settings.local.json` and `.claude/settings.json`, then `settings.json` in `CLAUDE_CONFIG_DIR` (`~/.claude` by default). Managed settings are not read.
+When the segments do not fit, the status line continues on the next line, breaking between segments. Claude Code gives the status line the terminal width minus 4 columns and the `statusLine.padding` setting on both sides. ccline reads the padding in Claude Code's order of precedence: `.claude/settings.local.json` at the root of the git repository the project is in, the project's own `.claude/settings.local.json` and `.claude/settings.json`, then `settings.json` in `CLAUDE_CONFIG_DIR` (`~/.claude` by default). Managed settings are not read.
+
+To keep the status line on one line, add `--no-wrap` to the command, as in `"command": "~/.claude/ccline/ccline --no-wrap"`.
 
 ## Configuration
 

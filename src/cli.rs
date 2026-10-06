@@ -15,6 +15,10 @@ pub struct Cli {
     /// Patch Claude Code cli.js to disable context warnings
     #[arg(long = "patch")]
     pub patch: Option<String>,
+
+    /// Keep the status line on one line instead of wrapping it to the terminal width
+    #[arg(long = "no-wrap")]
+    pub no_wrap: bool,
 }
 
 impl Cli {

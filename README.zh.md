@@ -221,11 +221,13 @@ Claude Code 提供推理档位（effort）和快速模式时，会显示在模�
 
 ### 提示缓存显示
 
-Claude Code 报告的提示缓存命中率，例如 `92% · 14:32`，即主对话的输入 token 中从缓存读取的比例。Claude Code 从启动时开始累计，恢复会话会重新计算，也不包括子代理。Claude 模型还会显示缓存的过期时间，过期后显示 `cold`。这个时间是 Claude Code 按 Anthropic 的缓存有效期算的，所以其他厂商的模型只显示比例。默认关闭，可在 `ccline --config` 中开启。
+Claude Code 报告的提示缓存命中率，例如 `92% · 14:32`，即主对话的输入 token 中从缓存读取的比例。Claude Code 从启动时开始累计，恢复会话会重新计算，也不包括子代理。Claude 模型（包括 Claude Code 通过 Bedrock、Vertex AI 或 Foundry 使用的 Claude 模型）还会显示缓存的过期时间，过期后显示 `cold`。这个时间是 Claude Code 按 Anthropic 的缓存有效期算的，所以其他厂商的模型只显示比例。默认关闭，可在 `ccline --config` 中开启。
 
 ### 自动换行
 
-一行放不下时，状态栏在段与段之间换到下一行。Claude Code 留给状态栏的宽度是终端宽度减去 4 列，再减去两侧的 `statusLine.padding`。ccline 按 Claude Code 的设置优先级读取 padding：先读项目的 `.claude/settings.local.json` 和 `.claude/settings.json`，再读 `CLAUDE_CONFIG_DIR`（默认 `~/.claude`）下的 `settings.json`。不读取托管设置（managed settings）。
+一行放不下时，状态栏在段与段之间换到下一行。Claude Code 留给状态栏的宽度是终端宽度减去 4 列，再减去两侧的 `statusLine.padding`。ccline 按 Claude Code 的设置优先级读取 padding：先读项目所在 git 仓库根目录的 `.claude/settings.local.json`，再读项目自己的 `.claude/settings.local.json` 和 `.claude/settings.json`，最后读 `CLAUDE_CONFIG_DIR`（默认 `~/.claude`）下的 `settings.json`。不读取托管设置（managed settings）。
+
+如需始终保持一行，在命令后加上 `--no-wrap`，例如 `"command": "~/.claude/ccline/ccline --no-wrap"`。
 
 ## 配置
 

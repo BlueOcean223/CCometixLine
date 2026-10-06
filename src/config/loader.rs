@@ -181,6 +181,9 @@ impl Config {
         if self.segments.is_empty() {
             return Err("No segments configured".into());
         }
+        if !self.segments.iter().any(|segment| segment.enabled) {
+            return Err("No segments enabled".into());
+        }
 
         // Validate segment IDs are unique
         let mut seen_ids = std::collections::HashSet::new();

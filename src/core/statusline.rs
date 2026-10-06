@@ -123,10 +123,9 @@ impl StatusLineGenerator {
         if !line.is_empty() {
             lines.push(line);
         }
-        if powerline {
-            for line in &mut lines {
-                line.push_str("\x1b[0m");
-            }
+        // Segments with a background leave their text style on, so each line resets it
+        for line in &mut lines {
+            line.push_str("\x1b[0m");
         }
         lines
     }

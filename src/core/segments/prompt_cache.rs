@@ -41,7 +41,8 @@ impl Segment for PromptCacheSegment {
         // Claude Code derives expiry from Anthropic's cache lifetimes (5 minutes or
         // 1 hour), which other providers' caches do not follow
         let mut details = Vec::new();
-        if self.show_expiry && input.model.id.to_lowercase().contains("claude") {
+        let claude = serves_claude(&input.model.id, |name| std::env::var(name).ok());
+        if self.show_expiry && claude {
             if !cache.warm {
                 details.push("cold".to_string());
             } else if let Some(time) = expires_at {
@@ -66,6 +67,31 @@ impl Segment for PromptCacheSegment {
     fn id(&self) -> SegmentId {
         SegmentId::PromptCache
     }
+}
+
+/// Cloud platforms that serve only Claude models, whose IDs there may be inference
+/// profile ARNs without "claude" in them
+const CLAUDE_PLATFORMS: [&str; 5] = [
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+];
+
+/// Whether the model is a Claude model: by its ID, or by Claude Code using one of
+/// `CLAUDE_PLATFORMS`, read with `env`. Claude Code takes "1", "true", "yes" and "on"
+/// as set.
+fn serves_claude(model_id: &str, env: impl Fn(&str) -> Option<String>) -> bool {
+    model_id.to_lowercase().contains("claude")
+        || CLAUDE_PLATFORMS.iter().any(|name| {
+            env(name).is_some_and(|value| {
+                matches!(
+                    value.trim().to_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        })
 }
 
 #[cfg(test)]
@@ -125,6 +151,21 @@ mod tests {
         .unwrap();
         assert_eq!(data.primary, "80%");
         assert_eq!(data.secondary, "");
+    }
+
+    #[test]
+    fn claude_platforms_serve_claude_models() {
+        let arn = "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/abc123";
+        let unset = |_: &str| -> Option<String> { None };
+        let bedrock = |value: &'static str| {
+            move |name: &str| (name == "CLAUDE_CODE_USE_BEDROCK").then(|| value.to_string())
+        };
+        assert!(!serves_claude(arn, unset));
+        assert!(serves_claude(arn, bedrock("1")));
+        assert!(serves_claude(arn, bedrock("true")));
+        assert!(!serves_claude(arn, bedrock("0")));
+        assert!(serves_claude("us.anthropic.claude-opus-5-5-v1:0", unset));
+        assert!(!serves_claude("deepseek-flash", unset));
     }
 
     #[test]
