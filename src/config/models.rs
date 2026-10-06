@@ -498,7 +498,8 @@ impl ModelConfig {
              # field falls back to the next matching entry when left out.\n\
              #\n\
              # context_limit is the model's real context window. The context segment uses\n\
-             # the smaller of it and the window Claude Code works with.\n\
+             # the smaller of it and the window Claude Code works with, also when the ID\n\
+             # carries [1m]. Claude models always use the window Claude Code reports.\n\
              #\n\
              # pricing makes the cost segment compute the session cost from transcripts\n\
              # instead of using Claude Code's figure, which prices unknown models at\n\

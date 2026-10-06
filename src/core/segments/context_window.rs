@@ -2,7 +2,7 @@ use super::{Segment, SegmentData};
 use crate::config::{InputData, ModelConfig, SegmentId, TranscriptEntry};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 #[derive(Default)]
@@ -19,14 +19,18 @@ impl ContextWindowSegment {
 /// The limit is the smaller of the model's real window (a models.toml entry) and the
 /// window Claude Code works with: a larger real window is cut short by Claude Code's
 /// auto-compact, a smaller one by API errors. Claude Code reports its window as
-/// `context_window_size`; older versions infer it from the model ID.
+/// `context_window_size`; older versions infer it from the model ID. Claude models
+/// use Claude Code's window alone, as it knows their real one. Earlier versions of
+/// ccline required `context_limit` even in entries that only rename a model.
 ///
-/// Tokens come from `context_window.current_usage`. While it is null (before the
-/// session's first API response and right after `/compact`), only the session's own
-/// transcript can stand in, which has usage when the session was resumed. Usage from
-/// before a compaction does not count, so `/compact` shows no usage until the next
-/// response. Older Claude Code versions without `context_window` use the transcript
-/// fallback, which may also take usage from the project's latest session.
+/// Tokens come from `context_window.current_usage` and count the last response's
+/// output, which becomes input on the next request; Claude Code's own
+/// `used_percentage` leaves it out. While it is null (before the session's first API
+/// response and right after `/compact`), only the session's own transcript can stand
+/// in, which has usage when the session was resumed. Usage from before a compaction
+/// does not count, so `/compact` shows no usage until the next response. Older Claude
+/// Code versions without `context_window` use the transcript fallback, which may also
+/// take usage from the project's latest session.
 fn resolve_context(input: &InputData, model_config: &ModelConfig) -> (Option<u32>, u32) {
     let native = input.context_window.as_ref();
 
@@ -34,17 +38,19 @@ fn resolve_context(input: &InputData, model_config: &ModelConfig) -> (Option<u32
         .and_then(|cw| cw.context_window_size)
         .filter(|&size| size > 0)
         .unwrap_or_else(|| model_config.get_inferred_context_limit(&input.model.id));
-    let context_limit = match model_config.get_entry_context_limit(&input.model.id) {
+    let model_limit = model_config
+        .get_entry_context_limit(&input.model.id)
+        .filter(|_| !input.model.id.to_lowercase().contains("claude"));
+    let context_limit = match model_limit {
         Some(model_limit) => model_limit.min(claude_code_limit),
         None => claude_code_limit,
     };
 
     let tokens = match native {
-        Some(cw) => cw
-            .current_usage
-            .as_ref()
-            .map(|usage| usage.context_tokens())
-            .or_else(|| try_parse_transcript_file(Path::new(&input.transcript_path))),
+        Some(cw) => match &cw.current_usage {
+            Some(usage) => Some(usage.clone().normalize().display_tokens()),
+            None => last_usage(Path::new(&input.transcript_path)).flatten(),
+        },
         None => parse_transcript_usage(&input.transcript_path),
     };
 
@@ -111,73 +117,95 @@ impl Segment for ContextWindowSegment {
     }
 }
 
+/// Usage for Claude Code versions without `context_window`: from the transcript, or
+/// from the project's latest session while the transcript does not exist yet
 fn parse_transcript_usage<P: AsRef<Path>>(transcript_path: P) -> Option<u32> {
     let path = transcript_path.as_ref();
-
-    // Try to parse from current transcript file
-    if let Some(usage) = try_parse_transcript_file(path) {
-        return Some(usage);
+    if path.exists() {
+        last_usage_or_summary(path).flatten()
+    } else {
+        try_find_usage_from_project_history(path)
     }
-
-    // If file doesn't exist, try to find usage from project history
-    if !path.exists() {
-        if let Some(usage) = try_find_usage_from_project_history(path) {
-            return Some(usage);
-        }
-    }
-
-    None
 }
 
-fn try_parse_transcript_file(path: &Path) -> Option<u32> {
-    let file = fs::File::open(path).ok()?;
-    let reader = BufReader::new(file);
-    let lines: Vec<String> = reader
-        .lines()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap_or_default();
+/// Usage of the transcript's last response; `Some(None)` when `/compact` replaced the
+/// context after it, and `None` when the transcript has neither.
+fn last_usage(path: &Path) -> Option<Option<u32>> {
+    find_from_end(path, |line| {
+        let entry: TranscriptEntry = serde_json::from_str(line).ok()?;
+        match entry.r#type.as_deref()? {
+            // Usage from before it describes the context that /compact replaced
+            "system" if entry.subtype.as_deref() == Some("compact_boundary") => Some(None),
+            "assistant" => Some(Some(entry.message?.usage?.normalize().display_tokens())),
+            _ => None,
+        }
+    })
+}
 
-    if lines.is_empty() {
-        return None;
-    }
-
-    // Check if the last line is a summary
-    let last_line = lines.last()?.trim();
-    if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(last_line) {
-        if entry.r#type.as_deref() == Some("summary") {
-            // Handle summary case: find usage by leafUuid
-            if let Some(leaf_uuid) = &entry.leaf_uuid {
-                let project_dir = path.parent()?;
-                return find_usage_by_leaf_uuid(leaf_uuid, project_dir);
-            }
+/// Like [`last_usage`], except that a transcript ending in a summary, which older
+/// Claude Code versions wrote, gives the usage of the response the summary points to
+fn last_usage_or_summary(path: &Path) -> Option<Option<u32>> {
+    let last = find_from_end(path, |line| {
+        Some(serde_json::from_str::<TranscriptEntry>(line).ok())
+    })
+    .flatten();
+    if let Some(entry) = last.filter(|entry| entry.r#type.as_deref() == Some("summary")) {
+        if let Some(leaf_uuid) = &entry.leaf_uuid {
+            return find_usage_by_leaf_uuid(leaf_uuid, path.parent()?).map(Some);
         }
     }
+    last_usage(path)
+}
 
-    // Normal case: find the last assistant message in current file. Usage from before a
-    // compaction boundary describes the context that /compact replaced.
-    for line in lines.iter().rev() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+/// Calls `visit` on the file's non-empty lines, trimmed, from the last one back, until
+/// it returns a value. The file is read in blocks from the end, as the lines needed
+/// are usually the last ones of a long transcript.
+fn find_from_end<T>(path: &Path, visit: impl FnMut(&str) -> Option<T>) -> Option<T> {
+    find_from_end_in_blocks(path, 64 * 1024, visit)
+}
 
-        if let Ok(entry) = serde_json::from_str::<TranscriptEntry>(line) {
-            if entry.r#type.as_deref() == Some("system")
-                && entry.subtype.as_deref() == Some("compact_boundary")
-            {
-                return None;
-            }
-            if entry.r#type.as_deref() == Some("assistant") {
-                if let Some(message) = &entry.message {
-                    if let Some(raw_usage) = &message.usage {
-                        let normalized = raw_usage.clone().normalize();
-                        return Some(normalized.display_tokens());
-                    }
+fn find_from_end_in_blocks<T>(
+    path: &Path,
+    first_block: u64,
+    mut visit: impl FnMut(&str) -> Option<T>,
+) -> Option<T> {
+    let mut file = fs::File::open(path).ok()?;
+    let mut end = file.metadata().ok()?.len();
+    let mut block_size = first_block.max(1);
+    // The part of a line that starts before the bytes read so far
+    let mut rest = Vec::new();
+    while end > 0 {
+        let start = end.saturating_sub(block_size);
+        let mut bytes = vec![0; (end - start) as usize];
+        file.seek(SeekFrom::Start(start)).ok()?;
+        file.read_exact(&mut bytes).ok()?;
+        bytes.append(&mut rest);
+
+        // Unless the block starts the file, its first line may start in an earlier one
+        let complete = if start == 0 {
+            0
+        } else {
+            bytes
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .map_or(bytes.len(), |newline| newline + 1)
+        };
+        for line in bytes[complete..].rsplit(|&byte| byte == b'\n') {
+            let line = String::from_utf8_lossy(line);
+            let line = line.trim();
+            if !line.is_empty() {
+                if let Some(found) = visit(line) {
+                    return Some(found);
                 }
             }
         }
-    }
 
+        bytes.truncate(complete);
+        rest = bytes;
+        end = start;
+        // Larger blocks keep a long line from being copied once per block
+        block_size = block_size.saturating_mul(2);
+    }
     None
 }
 
@@ -295,14 +323,12 @@ fn try_find_usage_from_project_history(transcript_path: &Path) -> Option<u32> {
     });
     session_files.reverse();
 
-    // Try to find usage from the most recent session
-    for session_path in &session_files {
-        if let Some(usage) = try_parse_transcript_file(session_path) {
-            return Some(usage);
-        }
-    }
-
-    None
+    // Usage from the most recent session that has any, or none when /compact replaced
+    // that session's context since
+    session_files
+        .iter()
+        .find_map(|session_path| last_usage_or_summary(session_path))
+        .flatten()
 }
 
 #[cfg(test)]
@@ -362,6 +388,66 @@ mod tests {
     }
 
     #[test]
+    fn claude_models_use_claude_codes_window() {
+        // An entry written for an earlier version, which required context_limit
+        let mut config = ModelConfig::default();
+        let user: ModelConfig = toml::from_str(
+            r#"
+            [[models]]
+            pattern = "claude-sonnet-4-5"
+            display_name = "Sonnet 4.5"
+            context_limit = 200000
+            "#,
+        )
+        .unwrap();
+        config.model_entries.splice(0..0, user.model_entries);
+        let input = input(
+            "claude-sonnet-4-5-20250929[1m]",
+            &format!(
+                r#","context_window":{{"context_window_size":1000000,{}}}"#,
+                USAGE
+            ),
+        );
+        assert_eq!(resolve_context(&input, &config).1, 1_000_000);
+    }
+
+    #[test]
+    fn project_history_stops_at_a_compacted_session() {
+        let dir = std::env::temp_dir().join(format!("ccline-history-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let response = |tokens: u32| {
+            format!(
+                r#"{{"type":"assistant","message":{{"usage":{{"input_tokens":{},"output_tokens":0}}}}}}"#,
+                tokens
+            ) + "\n"
+        };
+        let older = dir.join("older.jsonl");
+        let newer = dir.join("newer.jsonl");
+        fs::write(&older, response(50_000)).unwrap();
+        let hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        fs::File::options()
+            .write(true)
+            .open(&older)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        fs::write(
+            &newer,
+            response(180_000) + r#"{"type":"system","subtype":"compact_boundary"}"# + "\n",
+        )
+        .unwrap();
+
+        // Versions without context_window, before the new session's transcript exists
+        let new_session = dir.join("new.jsonl");
+        assert_eq!(parse_transcript_usage(&new_session), None);
+        fs::write(&newer, response(180_000)).unwrap();
+        assert_eq!(parse_transcript_usage(&new_session), Some(180_000));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn null_current_usage_reads_only_this_sessions_transcript() {
         let dir = std::env::temp_dir().join(format!("ccline-context-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -372,8 +458,18 @@ mod tests {
                 tokens
             ) + "\n"
         };
-        fs::write(dir.join("other.jsonl"), usage(350_000)).unwrap();
+        fs::write(
+            dir.join("other.jsonl"),
+            r#"{"type":"assistant","uuid":"u1","message":{"usage":{"input_tokens":350000,"output_tokens":0}}}"#,
+        )
+        .unwrap();
         fs::write(dir.join("resumed.jsonl"), usage(1_000)).unwrap();
+        // How older versions ended a transcript, pointing to the other session's response
+        fs::write(
+            dir.join("summarized.jsonl"),
+            r#"{"type":"summary","summary":"Earlier work","leafUuid":"u1"}"#,
+        )
+        .unwrap();
         let session = |name: &str, context_window: &str| -> InputData {
             let json = format!(
                 r#"{{"model":{{"id":"claude-opus-5-5","display_name":"Opus"}},"workspace":{{"current_dir":"/tmp"}},"transcript_path":"{}"{}}}"#,
@@ -385,7 +481,7 @@ mod tests {
         let null_usage = r#","context_window":{"context_window_size":200000,"current_usage":null}"#;
         let models = ModelConfig::default();
 
-        // A new session has no transcript yet, and other sessions say nothing about it
+        // A new session has no transcript yet, and other sessions' transcripts are not used
         assert_eq!(
             resolve_context(&session("new.jsonl", null_usage), &models).0,
             None
@@ -395,7 +491,15 @@ mod tests {
             resolve_context(&session("resumed.jsonl", null_usage), &models).0,
             Some(1_000)
         );
-        // Versions without context_window keep the project history fallback
+        assert_eq!(
+            resolve_context(&session("summarized.jsonl", null_usage), &models).0,
+            None
+        );
+        // Versions without context_window keep the summary and project history fallbacks
+        assert_eq!(
+            resolve_context(&session("summarized.jsonl", ""), &models).0,
+            Some(350_000)
+        );
         assert!(resolve_context(&session("new.jsonl", ""), &models)
             .0
             .is_some());
@@ -436,6 +540,45 @@ mod tests {
         // A session resumed after its first response since /compact
         fs::write(&path, format!("{}\n{}\n", compacted, response(30_000))).unwrap();
         assert_eq!(resolve_context(&input, &models).0, Some(30_000));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lines_are_read_from_the_end_across_blocks() {
+        let dir = std::env::temp_dir().join(format!("ccline-lines-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lines.jsonl");
+        let lines_from_end = |contents: &str, block_size: u64| {
+            fs::write(&path, contents).unwrap();
+            let mut lines = Vec::new();
+            find_from_end_in_blocks(&path, block_size, |line| {
+                lines.push(line.to_string());
+                None::<()>
+            });
+            lines
+        };
+
+        for block_size in 1..=8 {
+            // Lines longer than a block, and a character split between two blocks
+            assert_eq!(
+                lines_from_end("first line\nsé\n\n third \n", block_size),
+                ["third", "sé", "first line"]
+            );
+            // The last line may lack its newline
+            assert_eq!(lines_from_end("a\nbb", block_size), ["bb", "a"]);
+            assert!(lines_from_end("", block_size).is_empty());
+        }
+
+        // Reading stops at the first line that gives a value
+        fs::write(&path, "1\n2\n3\n").unwrap();
+        let mut visited = 0;
+        let found = find_from_end_in_blocks(&path, 1, |line| {
+            visited += 1;
+            (line == "2").then_some(line.len())
+        });
+        assert_eq!((found, visited), (Some(1), 2));
 
         let _ = fs::remove_dir_all(&dir);
     }

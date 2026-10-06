@@ -260,33 +260,9 @@ pub struct OutputStyle {
 #[derive(Deserialize)]
 pub struct ContextWindow {
     pub context_window_size: Option<u32>,
-    /// `null` before the first API response and right after `/compact`
-    pub current_usage: Option<CurrentUsage>,
-}
-
-#[derive(Deserialize)]
-pub struct CurrentUsage {
-    #[serde(default)]
-    pub input_tokens: u32,
-    #[serde(default)]
-    pub output_tokens: u32,
-    #[serde(default)]
-    pub cache_creation_input_tokens: u32,
-    #[serde(default)]
-    pub cache_read_input_tokens: u32,
-}
-
-impl CurrentUsage {
-    /// Tokens occupying the context window, including the last response's output,
-    /// which becomes input on the next request. Same formula as the transcript
-    /// fallback (`NormalizedUsage::context_tokens`); Claude Code's own
-    /// `used_percentage` excludes output tokens.
-    pub fn context_tokens(&self) -> u32 {
-        self.input_tokens
-            + self.cache_creation_input_tokens
-            + self.cache_read_input_tokens
-            + self.output_tokens
-    }
+    /// The last response's usage, as in transcripts. `null` before the first API
+    /// response and right after `/compact`
+    pub current_usage: Option<RawUsage>,
 }
 
 /// Present only for claude.ai Pro/Max subscribers, after the first API response.

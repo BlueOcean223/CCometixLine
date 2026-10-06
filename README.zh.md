@@ -273,7 +273,7 @@ CCometixLine 支持通过 TOML 文件和交互式 TUI 进行完整配置：
 此文件配置模型的显示名称、上下文窗口和价格。Claude 模型（Sonnet、Opus、Haiku）会自动识别并提取版本号。常见第三方模型（DeepSeek、GLM、Kimi、Qwen、MiniMax）已内置上下文窗口和国内平台的人民币价格，见 [`builtin_models.toml`](src/config/builtin_models.toml)。在此文件中添加条目可以覆盖内置值（例如改用国际平台的美元价格），或添加其他模型。旧版本还内置了按子字符串匹配的 `glm-4.5`、`kimi-k2` 和 `qwen3-coder` 条目（窗口 128k 到 256k），如果仍在使用这些模型，请自行添加条目并填写 `context_limit`。`ccline` 菜单中的 Check Configuration 会报告无法解析的 `models.toml`，状态栏本身会忽略这样的文件。
 
 - **显示名称**：没有配置名称的模型显示 Claude Code 给出的模型 ID，并去掉 `[1m]` 这类标签。
-- **上下文窗口**：上下文段取模型 `context_limit` 与 Claude Code 实际使用的窗口中较小的一个。对它不认识的模型 ID，Claude Code 在 ID 带 `[1m]` 时按 1M 处理，否则使用环境变量 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 的值，未设置时按 200k。Claude Code 按这个窗口决定何时压缩对话，所以它应与模型的实际窗口一致。
+- **上下文窗口**：上下文段取模型 `context_limit` 与 Claude Code 实际使用的窗口中较小的一个。对它不认识的模型 ID，Claude Code 在 ID 带 `[1m]` 时按 1M 处理，否则使用环境变量 `CLAUDE_CODE_MAX_CONTEXT_TOKENS` 的值，未设置时按 200k。Claude Code 按这个窗口决定何时压缩对话，所以它应与模型的实际窗口一致。与旧版本不同，`[1m]` 不再覆盖 `context_limit`。Claude 模型始终使用 Claude Code 报告的窗口。
 - **费用**：Claude Code 对不认识的模型按 Claude Opus 单价计费。配置了 `pricing` 的模型，费用段改为按这些单价汇总本会话的 transcript（含子代理和 workflow 代理）。当前模型的币种下没有价格的模型，其响应不计入，费用末尾会加 `+`，例如 `¥1.20+`。Claude Code 不写入 transcript 的请求（如会话标题生成）不计入。
 - **峰谷价格**：每个请求按发出的时间计价。不识别法定节假日，节假日里的工作日在高峰时段的请求按高峰价计算。
 
